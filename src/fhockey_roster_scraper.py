@@ -300,18 +300,17 @@ class URLBuilder:
         base_url = base_url.rstrip('/')
 
         if url_format == 'default':
-            # Standard Sidearm Sports: /sports/field-hockey/roster
-            # Add season if it seems like it should be there
-            return f"{base_url}/roster"
+            # Standard Sidearm Sports: /sports/field-hockey/roster/YEAR
+            return f"{base_url}/roster/{season}"
 
         elif url_format == 'fhockey':
-            # /sports/fhockey/roster format (e.g., Iowa, Ohio)
-            return f"{base_url}/roster"
+            # /sports/fhockey/roster/YEAR format (e.g., Iowa, Ohio)
+            return f"{base_url}/roster/{season}"
 
         else:
             # Fallback to default
             logger.warning(f"Unknown url_format '{url_format}', using default")
-            return f"{base_url}/roster"
+            return f"{base_url}/roster/{season}"
 
     @staticmethod
     def extract_base_url(full_url: str) -> str:
@@ -460,13 +459,21 @@ class StandardScraper:
             # Fetch roster page
             response = self.session.get(roster_url, headers=request_headers, timeout=30, allow_redirects=True)
 
-            # Try alternative URL if 404
+            # Try alternative URLs if failed
             if response.status_code == 404:
-                logger.info(f"Got 404, trying /roster.aspx for {team_name}")
-                alternative_url = f"{base_url.rstrip('/')}/roster.aspx"
-                response = self.session.get(alternative_url, headers=self.headers, timeout=30)
+                # Try without year
+                logger.info(f"Got 404, trying /roster without year for {team_name}")
+                alternative_url = f"{base_url.rstrip('/')}/roster"
+                response = self.session.get(alternative_url, headers=request_headers, timeout=30, allow_redirects=True)
                 if response.status_code == 200:
                     roster_url = alternative_url
+                else:
+                    # Try .aspx format
+                    logger.info(f"Got 404, trying /roster.aspx for {team_name}")
+                    alternative_url = f"{base_url.rstrip('/')}/roster.aspx"
+                    response = self.session.get(alternative_url, headers=request_headers, timeout=30, allow_redirects=True)
+                    if response.status_code == 200:
+                        roster_url = alternative_url
 
             if response.status_code != 200:
                 logger.warning(f"Failed to retrieve {team_name} - Status: {response.status_code}")
