@@ -23,6 +23,12 @@ import requests
 from bs4 import BeautifulSoup
 import tldextract
 
+try:
+    import cloudscraper
+    CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    CLOUDSCRAPER_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -294,18 +300,17 @@ class URLBuilder:
         base_url = base_url.rstrip('/')
 
         if url_format == 'default':
-            # Standard Sidearm Sports: /sports/field-hockey/roster
-            # Add season if it seems like it should be there
-            return f"{base_url}/roster"
+            # Standard Sidearm Sports: /sports/field-hockey/roster/YEAR
+            return f"{base_url}/roster/{season}"
 
         elif url_format == 'fhockey':
-            # /sports/fhockey/roster format (e.g., Iowa, Ohio)
-            return f"{base_url}/roster"
+            # /sports/fhockey/roster/YEAR format (e.g., Iowa, Ohio)
+            return f"{base_url}/roster/{season}"
 
         else:
             # Fallback to default
             logger.warning(f"Unknown url_format '{url_format}', using default")
-            return f"{base_url}/roster"
+            return f"{base_url}/roster/{season}"
 
     @staticmethod
     def extract_base_url(full_url: str) -> str:
@@ -383,19 +388,37 @@ class TeamConfig:
 class StandardScraper:
     """Scraper for standard Sidearm Sports sites"""
 
-    def __init__(self, session: Optional[requests.Session] = None):
-        """Initialize scraper"""
-        self.session = session or requests.Session()
+    def __init__(self, session: Optional[requests.Session] = None, scrape_profiles: bool = True):
+        """Initialize scraper
+
+        Args:
+            session: Optional requests session
+            scrape_profiles: Whether to scrape individual player profile pages for detailed info
+        """
+        if session:
+            self.session = session
+        elif CLOUDSCRAPER_AVAILABLE:
+            # Use cloudscraper to bypass bot protection
+            self.session = cloudscraper.create_scraper()
+            logger.info("Using cloudscraper to bypass bot protection")
+        else:
+            self.session = requests.Session()
+            logger.warning("cloudscraper not available, using standard requests (may encounter 403 errors)")
+
+        self.scrape_profiles = scrape_profiles
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:106.0) Gecko/20100101 Firefox/106.0',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
             'Sec-Fetch-Dest': 'document',
             'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none'
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
         }
 
     def scrape_team(self, team_id: int, team_name: str, base_url: str, season: str, division: str = "") -> List[Player]:
@@ -419,16 +442,38 @@ class StandardScraper:
 
             logger.info(f"Scraping {team_name} - {roster_url}")
 
-            # Fetch page
-            response = self.session.get(roster_url, headers=self.headers, timeout=30)
+            # Update headers with referer for this specific domain
+            request_headers = self.headers.copy()
+            domain_base = base_url.split('/sports')[0] if '/sports' in base_url else base_url
+            request_headers['Referer'] = domain_base
+            request_headers['Origin'] = domain_base
 
-            # Try alternative URL if 404
+            # First visit the base domain to establish session (mimic normal browsing)
+            import time
+            try:
+                self.session.get(domain_base, headers=self.headers, timeout=10, allow_redirects=True)
+                time.sleep(0.5)  # Small delay to mimic human behavior
+            except:
+                pass  # Continue even if base page fails
+
+            # Fetch roster page
+            response = self.session.get(roster_url, headers=request_headers, timeout=30, allow_redirects=True)
+
+            # Try alternative URLs if failed
             if response.status_code == 404:
-                logger.info(f"Got 404, trying /roster.aspx for {team_name}")
-                alternative_url = f"{base_url.rstrip('/')}/roster.aspx"
-                response = self.session.get(alternative_url, headers=self.headers, timeout=30)
+                # Try without year
+                logger.info(f"Got 404, trying /roster without year for {team_name}")
+                alternative_url = f"{base_url.rstrip('/')}/roster"
+                response = self.session.get(alternative_url, headers=request_headers, timeout=30, allow_redirects=True)
                 if response.status_code == 200:
                     roster_url = alternative_url
+                else:
+                    # Try .aspx format
+                    logger.info(f"Got 404, trying /roster.aspx for {team_name}")
+                    alternative_url = f"{base_url.rstrip('/')}/roster.aspx"
+                    response = self.session.get(alternative_url, headers=request_headers, timeout=30, allow_redirects=True)
+                    if response.status_code == 200:
+                        roster_url = alternative_url
 
             if response.status_code != 200:
                 logger.warning(f"Failed to retrieve {team_name} - Status: {response.status_code}")
@@ -454,6 +499,161 @@ class StandardScraper:
         except Exception as e:
             logger.error(f"Error scraping {team_name}: {e}")
             return []
+
+    def _scrape_player_profile(self, player: Player) -> Player:
+        """
+        Scrape individual player profile page for detailed information
+
+        Args:
+            player: Player object with URL populated
+
+        Returns:
+            Updated Player object with profile details
+        """
+        if not player.url:
+            return player
+
+        try:
+            import time
+            time.sleep(0.5)  # Rate limiting
+
+            response = self.session.get(player.url, headers=self.headers, timeout=30)
+            if response.status_code != 200:
+                logger.warning(f"Failed to fetch profile for {player.name}: {response.status_code}")
+                return player
+
+            html = BeautifulSoup(response.content, 'html.parser')
+
+            # Extract from bio/details section
+            bio_section = html.find('div', class_='sidearm-roster-player-bio')
+            if bio_section:
+                # Find all bio fields
+                bio_items = bio_section.find_all('div', class_='sidearm-roster-player-bio-item')
+                for item in bio_items:
+                    label_elem = item.find('span', class_='sidearm-roster-player-bio-label')
+                    value_elem = item.find('span', class_='sidearm-roster-player-bio-value')
+
+                    if label_elem and value_elem:
+                        label = FieldExtractors.clean_text(label_elem.get_text()).lower()
+                        value = FieldExtractors.clean_text(value_elem.get_text())
+
+                        if not value or value == '-':
+                            continue
+
+                        # Position
+                        if 'position' in label or 'pos' in label:
+                            if not player.position:
+                                player.position = FieldExtractors.extract_position(value)
+                        # Height
+                        elif 'height' in label or 'ht' in label:
+                            if not player.height:
+                                player.height = FieldExtractors.extract_height(value) or value
+                        # Year/Class
+                        elif 'class' in label or 'year' in label or 'eligibility' in label:
+                            if not player.year:
+                                player.year = FieldExtractors.normalize_academic_year(value)
+                        # Major
+                        elif 'major' in label or 'academic' in label:
+                            if not player.major:
+                                player.major = value
+                        # Hometown
+                        elif 'hometown' in label:
+                            if not player.hometown:
+                                hometown, hs = FieldExtractors.extract_hometown_parts(value)
+                                player.hometown = hometown
+                                if hs and not player.high_school:
+                                    player.high_school = hs
+                        # High School
+                        elif 'high school' in label or 'hs' in label:
+                            if not player.high_school:
+                                player.high_school = value
+                        # Previous School
+                        elif 'previous school' in label or 'last school' in label or 'transfer' in label:
+                            if not player.previous_school:
+                                player.previous_school = value
+
+            # Also check for dl/dt/dd format (common alternative)
+            dl_section = html.find('dl', class_='sidearm-roster-player-bio')
+            if dl_section:
+                dts = dl_section.find_all('dt')
+                dds = dl_section.find_all('dd')
+
+                for dt, dd in zip(dts, dds):
+                    label = FieldExtractors.clean_text(dt.get_text()).lower()
+                    value = FieldExtractors.clean_text(dd.get_text())
+
+                    if not value or value == '-':
+                        continue
+
+                    if 'position' in label or 'pos' in label:
+                        if not player.position:
+                            player.position = FieldExtractors.extract_position(value)
+                    elif 'height' in label or 'ht' in label:
+                        if not player.height:
+                            player.height = FieldExtractors.extract_height(value) or value
+                    elif 'class' in label or 'year' in label or 'eligibility' in label:
+                        if not player.year:
+                            player.year = FieldExtractors.normalize_academic_year(value)
+                    elif 'major' in label or 'academic' in label:
+                        if not player.major:
+                            player.major = value
+                    elif 'hometown' in label:
+                        if not player.hometown:
+                            hometown, hs = FieldExtractors.extract_hometown_parts(value)
+                            player.hometown = hometown
+                            if hs and not player.high_school:
+                                player.high_school = hs
+                    elif 'high school' in label or 'hs' in label:
+                        if not player.high_school:
+                            player.high_school = value
+                    elif 'previous school' in label or 'last school' in label or 'transfer' in label:
+                        if not player.previous_school:
+                            player.previous_school = value
+
+            # Look for any table with player details
+            detail_tables = html.find_all('table', class_='sidearm-table')
+            for table in detail_tables:
+                rows = table.find_all('tr')
+                for row in rows:
+                    cells = row.find_all(['th', 'td'])
+                    if len(cells) >= 2:
+                        label = FieldExtractors.clean_text(cells[0].get_text()).lower()
+                        value = FieldExtractors.clean_text(cells[1].get_text())
+
+                        if not value or value == '-':
+                            continue
+
+                        if 'position' in label:
+                            if not player.position:
+                                player.position = FieldExtractors.extract_position(value)
+                        elif 'height' in label:
+                            if not player.height:
+                                player.height = FieldExtractors.extract_height(value) or value
+                        elif 'class' in label or 'year' in label:
+                            if not player.year:
+                                player.year = FieldExtractors.normalize_academic_year(value)
+                        elif 'major' in label:
+                            if not player.major:
+                                player.major = value
+                        elif 'hometown' in label:
+                            if not player.hometown:
+                                hometown, hs = FieldExtractors.extract_hometown_parts(value)
+                                player.hometown = hometown
+                                if hs and not player.high_school:
+                                    player.high_school = hs
+                        elif 'high school' in label:
+                            if not player.high_school:
+                                player.high_school = value
+                        elif 'previous school' in label:
+                            if not player.previous_school:
+                                player.previous_school = value
+
+        except requests.RequestException as e:
+            logger.warning(f"Request error fetching profile for {player.name}: {e}")
+        except Exception as e:
+            logger.warning(f"Error parsing profile for {player.name}: {e}")
+
+        return player
 
     def _extract_players(self, html, team_id: int, team_name: str, season: str, division: str, base_url: str) -> List[Player]:
         """Extract players from HTML"""
@@ -544,6 +744,11 @@ class StandardScraper:
                     high_school=high_school,
                     url=profile_url
                 )
+
+                # Scrape player profile page if enabled and URL exists
+                if self.scrape_profiles and profile_url:
+                    player = self._scrape_player_profile(player)
+
                 players.append(player)
 
             except Exception as e:
@@ -674,6 +879,11 @@ class StandardScraper:
                     high_school=high_school,
                     url=profile_url
                 )
+
+                # Scrape player profile page if enabled and URL exists
+                if self.scrape_profiles and profile_url:
+                    player = self._scrape_player_profile(player)
+
                 players.append(player)
 
             except Exception as e:
@@ -690,17 +900,18 @@ class StandardScraper:
 class RosterManager:
     """Manages batch scraping of rosters with error tracking"""
 
-    def __init__(self, season: str = '2025', output_dir: str = 'data/raw'):
+    def __init__(self, season: str = '2025', output_dir: str = 'data/raw', scrape_profiles: bool = True):
         """
         Initialize RosterManager
 
         Args:
             season: Season string (e.g., '2025')
             output_dir: Base output directory
+            scrape_profiles: Whether to scrape individual player profile pages
         """
         self.season = season
         self.output_dir = Path(output_dir)
-        self.scraper = StandardScraper()
+        self.scraper = StandardScraper(scrape_profiles=scrape_profiles)
 
         # Error tracking
         self.zero_player_teams = []
@@ -903,10 +1114,24 @@ Examples:
         help='Output directory (default: data/raw)'
     )
 
+    parser.add_argument(
+        '--scrape-profiles',
+        action='store_true',
+        default=True,
+        help='Scrape individual player profile pages for detailed info (default: True)'
+    )
+
+    parser.add_argument(
+        '--no-scrape-profiles',
+        action='store_false',
+        dest='scrape_profiles',
+        help='Skip scraping individual player profile pages'
+    )
+
     args = parser.parse_args()
 
     # Initialize manager
-    manager = RosterManager(season=args.season, output_dir=args.output_dir)
+    manager = RosterManager(season=args.season, output_dir=args.output_dir, scrape_profiles=args.scrape_profiles)
 
     # Load teams
     if args.team:
