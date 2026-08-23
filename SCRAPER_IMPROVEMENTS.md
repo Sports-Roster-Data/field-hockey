@@ -1,5 +1,12 @@
 # Field Hockey Roster Scraper - Improvements & Bot Protection Issue
 
+> **Update:** The bot-protection blocker described below has been addressed by
+> adding a Playwright-based browser fetch layer (`BrowserFetcher`), now the
+> default fetch strategy. Roster pages are rendered in headless Chromium instead
+> of fetched with plain HTTP, which gets past the Sidearm 403s and JavaScript
+> rendering. See `README_SCRAPER.md` for usage. The historical analysis below is
+> retained for context.
+
 ## Summary
 
 Enhanced the field hockey roster scraper to extract detailed player information from individual profile pages. However, the Sidearm Sports platform (used by most NCAA field hockey teams) has implemented strong bot protection that blocks automated access.

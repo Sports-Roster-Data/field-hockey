@@ -22,41 +22,86 @@ NCAA Field Hockey roster scraper based on the women's soccer scraper architectur
 
 ## Installation
 
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+
 ```bash
-pip install -r requirements.txt
+uv sync                          # install dependencies into .venv
+uv run playwright install chromium   # one-time: download the browser used for fetching
 ```
 
+`uv run` executes commands inside the managed environment, so no manual
+activation is needed.
+
+## Fetching strategy
+
+By default the scraper renders each roster page in a **real headless Chromium
+browser** (via Playwright). This is what gets past the bot protection used by
+Sidearm Sports team sites, which returns 403 to plain HTTP requests.
+
+- `--fetch auto` (default): use the browser if Playwright is available, otherwise
+  fall back to `requests`/`cloudscraper`.
+- `--fetch browser`: require the browser (error if unavailable).
+- `--fetch requests`: plain HTTP only (fast, but blocked by most team sites).
+
+The browser fetcher blocks images/fonts/media, adds a jittered delay between
+requests, and retries transient failures with backoff.
+
+> Note: headless Chromium gets past most, but not necessarily all, bot
+> protection. Measure the real success rate by running against the live team
+> sites from your machine.
+
 ## Usage
+
+Paths default to the repository root, so these work from any directory.
 
 ### Scrape all teams
 
 ```bash
-python src/fhockey_roster_scraper.py --season 2025
+uv run src/fhockey_roster_scraper.py --season 2025
 ```
 
 ### Scrape first 10 teams (testing)
 
 ```bash
-python src/fhockey_roster_scraper.py --limit 10 --season 2025
+uv run src/fhockey_roster_scraper.py --limit 10 --season 2025
 ```
 
 ### Scrape specific team
 
 ```bash
-python src/fhockey_roster_scraper.py --team 457 --season 2025
+uv run src/fhockey_roster_scraper.py --team 457 --season 2025
 ```
 
-### Custom teams CSV path
+### Plain HTTP instead of a browser
 
 ```bash
-python src/fhockey_roster_scraper.py --teams-csv path/to/teams.csv --season 2025
+uv run src/fhockey_roster_scraper.py --fetch requests --season 2025
 ```
 
-### Custom output directory
+### Custom teams CSV / output directory
 
 ```bash
-python src/fhockey_roster_scraper.py --output-dir data/output --season 2025
+uv run src/fhockey_roster_scraper.py --teams-csv path/to/teams.csv --output-dir data/output --season 2025
 ```
+
+## Caching and resume
+
+Each team's result is cached to `data/raw/teams/{ncaa_id}_{season}.json` as it
+completes. Re-running skips teams that already succeeded (status `ok`) or
+returned an empty roster, and automatically **retries** teams that previously
+failed — so an interrupted run resumes without re-scraping everything. Use
+`--refresh` to ignore the cache and re-scrape all teams.
+
+## Testing
+
+```bash
+uv run pytest
+```
+
+Unit tests cover the field extractors and label matching; parser tests cover the
+card-list and table roster formats against fixture HTML; a browser test renders a
+local fixture page through Playwright (skipped automatically if Chromium is
+unavailable).
 
 ## Output
 
@@ -71,37 +116,18 @@ The scraper generates the following output files:
 
 ### Bot Protection (403 Errors)
 
-Many NCAA athletic websites (particularly those using Sidearm Sports) have bot protection (Cloudflare, PerimeterX, etc.) that blocks automated requests with 403 Forbidden errors. This affects the majority of field hockey teams.
+Many NCAA athletic websites (particularly those using Sidearm Sports) have bot
+protection (Cloudflare, PerimeterX, etc.) that blocks plain automated requests
+with 403 Forbidden errors. The default **browser fetching** path (Playwright +
+headless Chromium) is designed to get past this by loading pages the way a real
+browser does, and it also handles JavaScript-rendered rosters for free.
 
-**Solutions:**
+If some teams still fail after a browser run, options include:
 
-1. **Use browser automation tools** like Selenium or Playwright:
-   ```python
-   # Example with Selenium
-   from selenium import webdriver
-   from selenium.webdriver.chrome.options import Options
-
-   options = Options()
-   options.add_argument('--headless')
-   driver = webdriver.Chrome(options=options)
-   driver.get(roster_url)
-   html = driver.page_source
-   # Then parse with BeautifulSoup
-   ```
-
-2. **Use a proxy service** or residential IPs
-
-3. **Rate limiting**: Add delays between requests (though this may not solve 403 errors)
-
-4. **Manual data collection**: For small datasets, manual collection may be more efficient
-
-### JavaScript-Rendered Content
-
-Some sites load roster data dynamically via JavaScript. For these sites, you'll need to:
-
-- Use Selenium/Playwright to render the page
-- Wait for JavaScript to load the content
-- Then extract the data from the rendered HTML
+1. **Residential/rotating proxies** for the hardest sites.
+2. **Slower pacing** — increase the delay in `BrowserFetcher` (the `min_delay` /
+   `max_delay` constructor arguments).
+3. **Manual collection** for the small number of remaining holdouts.
 
 ## Field Hockey Positions
 
@@ -128,11 +154,15 @@ TEAM_CONFIGS = {
 The scraper follows a modular architecture:
 
 - **Player dataclass**: Structured player data
-- **FieldExtractors**: Utilities for extracting and cleaning player fields
+- **FieldExtractors**: Utilities for extracting and cleaning player fields, plus
+  the shared `match_bio_label` / `apply_bio_field` label mapping used by every
+  parsing path
+- **BrowserFetcher / RequestsFetcher**: Pluggable fetch layer (`build_fetcher`
+  selects one); `BrowserFetcher` renders pages in headless Chromium
 - **URLBuilder**: Constructs roster URLs from base URLs
 - **TeamConfig**: Team-specific configuration and categorization
-- **StandardScraper**: Main scraping logic for standard HTML sites
-- **RosterManager**: Batch processing and error tracking
+- **StandardScraper**: Roster parsing (card-list and table formats) over a fetcher
+- **RosterManager**: Batch processing, per-team caching/resume, and error tracking
 
 This architecture is based on the [women's soccer scraper](https://github.com/Sports-Roster-Data/soccer).
 

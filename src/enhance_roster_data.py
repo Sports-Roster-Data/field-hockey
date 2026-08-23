@@ -1,300 +1,153 @@
 #!/usr/bin/env python3
 """
-Enhance existing roster CSV by scraping individual player profile pages
-for missing details
+Enhance an existing roster CSV by scraping individual player profile pages
+for missing details.
 
 Usage:
-    python src/enhance_roster_data.py --input rosters_fhockey_2025.csv --output rosters_enhanced.csv
+    uv run src/enhance_roster_data.py --input rosters_fhockey_2025.csv --output rosters_enhanced.csv
 """
 
 import csv
 import argparse
 import logging
-import time
-from typing import Dict, Optional
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
 
-import requests
 from bs4 import BeautifulSoup
 
-try:
-    import cloudscraper
-    CLOUDSCRAPER_AVAILABLE = True
-except ImportError:
-    CLOUDSCRAPER_AVAILABLE = False
+# Reuse the shared scraper utilities (portable: derive path from this file).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fhockey_roster_scraper import (  # noqa: E402
+    parse_player_profile,
+    build_fetcher,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-# Import field extractors from main scraper
-import sys
-sys.path.insert(0, '/home/user/field-hockey/src')
-from fhockey_roster_scraper import FieldExtractors
-
-
 class ProfileEnhancer:
-    """Enhance roster data by scraping individual player profiles"""
+    """Enhance roster data by scraping individual player profiles."""
 
-    def __init__(self, delay: float = 0.5):
-        """Initialize enhancer
+    def __init__(self, fetch_mode: str = 'auto'):
+        self.fetcher = build_fetcher(fetch_mode)
 
-        Args:
-            delay: Delay between requests in seconds
+    def close(self):
+        self.fetcher.close()
+
+    def scrape_player_profile(self, row: Dict, force: bool = False) -> bool:
         """
-        if CLOUDSCRAPER_AVAILABLE:
-            self.session = cloudscraper.create_scraper()
-            logger.info("Using cloudscraper to bypass bot protection")
-        else:
-            self.session = requests.Session()
-            logger.warning("cloudscraper not available, using standard requests")
+        Scrape a player profile and fill missing fields in `row` (in place).
 
-        self.delay = delay
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0'
-        }
-
-    def scrape_player_profile(self, row: Dict, force: bool = False) -> Dict:
+        Returns True if the row was modified.
         """
-        Scrape player profile and enhance row data
-
-        Args:
-            row: CSV row dict
-            force: Force re-scrape even if data exists
-
-        Returns:
-            Enhanced row dict
-        """
-        url = row.get('url', '').strip()
+        url = (row.get('url') or '').strip()
         if not url:
-            return row
+            return False
 
-        # Skip if already has data (unless force)
+        # Skip if the row already has the core fields (unless force)
         if not force:
-            has_data = any([
-                row.get('position'),
-                row.get('height'),
-                row.get('class'),
-                row.get('hometown')
-            ])
+            has_data = any([row.get('position'), row.get('height'),
+                            row.get('class'), row.get('hometown')])
             if has_data:
                 logger.debug(f"Skipping {row.get('name')} - already has data")
-                return row
+                return False
 
         try:
-            time.sleep(self.delay)
+            referer = url.split('/sports')[0] if '/sports' in url else None
+            status, content = self.fetcher.fetch(url, referer=referer)
+            if status != 200:
+                logger.warning(f"Failed to fetch {url}: {status}")
+                return False
 
-            # Add referer from URL domain
-            request_headers = self.headers.copy()
-            if 'https://' in url:
-                domain = url.split('/sports')[0] if '/sports' in url else '/'.join(url.split('/')[:3])
-                request_headers['Referer'] = domain
+            html = BeautifulSoup(content, 'html.parser')
+            changed = parse_player_profile(html, row)
+            if changed:
+                logger.info(f"OK Enhanced {row.get('name', 'Unknown')}")
+            return changed
 
-            response = self.session.get(url, headers=request_headers, timeout=30)
-            if response.status_code != 200:
-                logger.warning(f"Failed to fetch {url}: {response.status_code}")
-                return row
-
-            html = BeautifulSoup(response.content, 'html.parser')
-
-            # Extract from bio/details section
-            bio_section = html.find('div', class_='sidearm-roster-player-bio')
-            if bio_section:
-                bio_items = bio_section.find_all('div', class_='sidearm-roster-player-bio-item')
-                for item in bio_items:
-                    label_elem = item.find('span', class_='sidearm-roster-player-bio-label')
-                    value_elem = item.find('span', class_='sidearm-roster-player-bio-value')
-
-                    if label_elem and value_elem:
-                        label = FieldExtractors.clean_text(label_elem.get_text()).lower()
-                        value = FieldExtractors.clean_text(value_elem.get_text())
-
-                        if not value or value == '-':
-                            continue
-
-                        if ('position' in label or 'pos' in label) and not row.get('position'):
-                            row['position'] = FieldExtractors.extract_position(value)
-                        elif ('height' in label or 'ht' in label) and not row.get('height'):
-                            row['height'] = FieldExtractors.extract_height(value) or value
-                        elif ('class' in label or 'year' in label or 'eligibility' in label) and not row.get('class'):
-                            row['class'] = FieldExtractors.normalize_academic_year(value)
-                        elif ('major' in label or 'academic' in label) and not row.get('major'):
-                            row['major'] = value
-                        elif 'hometown' in label and not row.get('hometown'):
-                            hometown, hs = FieldExtractors.extract_hometown_parts(value)
-                            row['hometown'] = hometown
-                            if hs and not row.get('high_school'):
-                                row['high_school'] = hs
-                        elif ('high school' in label or 'hs' in label) and not row.get('high_school'):
-                            row['high_school'] = value
-                        elif ('previous school' in label or 'last school' in label or 'transfer' in label) and not row.get('previous_school'):
-                            row['previous_school'] = value
-
-            # Also check for dl/dt/dd format
-            dl_section = html.find('dl', class_='sidearm-roster-player-bio')
-            if dl_section:
-                dts = dl_section.find_all('dt')
-                dds = dl_section.find_all('dd')
-
-                for dt, dd in zip(dts, dds):
-                    label = FieldExtractors.clean_text(dt.get_text()).lower()
-                    value = FieldExtractors.clean_text(dd.get_text())
-
-                    if not value or value == '-':
-                        continue
-
-                    if ('position' in label or 'pos' in label) and not row.get('position'):
-                        row['position'] = FieldExtractors.extract_position(value)
-                    elif ('height' in label or 'ht' in label) and not row.get('height'):
-                        row['height'] = FieldExtractors.extract_height(value) or value
-                    elif ('class' in label or 'year' in label or 'eligibility' in label) and not row.get('class'):
-                        row['class'] = FieldExtractors.normalize_academic_year(value)
-                    elif ('major' in label or 'academic' in label) and not row.get('major'):
-                        row['major'] = value
-                    elif 'hometown' in label and not row.get('hometown'):
-                        hometown, hs = FieldExtractors.extract_hometown_parts(value)
-                        row['hometown'] = hometown
-                        if hs and not row.get('high_school'):
-                            row['high_school'] = hs
-                    elif ('high school' in label or 'hs' in label) and not row.get('high_school'):
-                        row['high_school'] = value
-                    elif ('previous school' in label or 'last school' in label or 'transfer' in label) and not row.get('previous_school'):
-                        row['previous_school'] = value
-
-            # Look for tables with player details
-            detail_tables = html.find_all('table', class_='sidearm-table')
-            for table in detail_tables:
-                rows_html = table.find_all('tr')
-                for row_html in rows_html:
-                    cells = row_html.find_all(['th', 'td'])
-                    if len(cells) >= 2:
-                        label = FieldExtractors.clean_text(cells[0].get_text()).lower()
-                        value = FieldExtractors.clean_text(cells[1].get_text())
-
-                        if not value or value == '-':
-                            continue
-
-                        if ('position' in label) and not row.get('position'):
-                            row['position'] = FieldExtractors.extract_position(value)
-                        elif ('height' in label) and not row.get('height'):
-                            row['height'] = FieldExtractors.extract_height(value) or value
-                        elif ('class' in label or 'year' in label) and not row.get('class'):
-                            row['class'] = FieldExtractors.normalize_academic_year(value)
-                        elif ('major' in label) and not row.get('major'):
-                            row['major'] = value
-                        elif ('hometown' in label) and not row.get('hometown'):
-                            hometown, hs = FieldExtractors.extract_hometown_parts(value)
-                            row['hometown'] = hometown
-                            if hs and not row.get('high_school'):
-                                row['high_school'] = hs
-                        elif ('high school' in label) and not row.get('high_school'):
-                            row['high_school'] = value
-                        elif ('previous school' in label) and not row.get('previous_school'):
-                            row['previous_school'] = value
-
-            logger.info(f"✓ Enhanced {row.get('name', 'Unknown')}")
-
-        except requests.RequestException as e:
-            logger.warning(f"Request error for {url}: {e}")
         except Exception as e:
             logger.warning(f"Error processing {url}: {e}")
+            return False
 
-        return row
-
-    def enhance_csv(self, input_file: str, output_file: str, force: bool = False, team_filter: Optional[str] = None):
+    def enhance_csv(self, input_file: str, output_file: str, force: bool = False,
+                    team_filter: Optional[str] = None, checkpoint_every: int = 25):
         """
-        Read CSV, enhance data, write new CSV
-
-        Args:
-            input_file: Input CSV path
-            output_file: Output CSV path
-            force: Force re-scrape even if data exists
-            team_filter: Optional team name to filter (only enhance this team)
+        Read a roster CSV, enhance rows from their profile pages, and write the
+        result. Output is written incrementally (checkpointed) so a crash does
+        not discard completed work.
         """
-        rows = []
+        rows: List[Dict] = []
         with open(input_file, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames
+            input_fieldnames = list(reader.fieldnames or [])
             for row in reader:
                 rows.append(row)
 
         logger.info(f"Loaded {len(rows)} players from {input_file}")
 
         if team_filter:
-            rows = [r for r in rows if r.get('team', '').lower() == team_filter.lower()]
+            rows = [r for r in rows if (r.get('team', '') or '').lower() == team_filter.lower()]
             logger.info(f"Filtered to {len(rows)} players for team '{team_filter}'")
 
+        # Fields enhancement may add that weren't in the input header
+        extra_fields = ['position', 'height', 'class', 'major', 'hometown',
+                        'high_school', 'previous_school']
+        fieldnames = list(input_fieldnames)
+        for k in extra_fields:
+            if k not in fieldnames:
+                fieldnames.append(k)
+
         enhanced_count = 0
+        output_path = Path(output_file)
+        tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
+
         for i, row in enumerate(rows, 1):
             logger.info(f"[{i}/{len(rows)}] Processing {row.get('team')} - {row.get('name')}")
-
-            original_row = row.copy()
-            enhanced_row = self.scrape_player_profile(row, force=force)
-
-            # Check if anything changed
-            if enhanced_row != original_row:
+            if self.scrape_player_profile(row, force=force):
                 enhanced_count += 1
 
-        # Write output
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            # Checkpoint: flush progress to a temp file periodically
+            if checkpoint_every and i % checkpoint_every == 0:
+                self._write_rows(tmp_path, fieldnames, rows)
+                logger.info(f"  Checkpoint written ({i}/{len(rows)})")
+
+        # Final write, then atomically move into place
+        self._write_rows(tmp_path, fieldnames, rows)
+        tmp_path.replace(output_path)
+
+        logger.info(f"OK Enhanced {enhanced_count} players")
+        logger.info(f"OK Wrote {len(rows)} players to {output_file}")
+
+    @staticmethod
+    def _write_rows(path: Path, fieldnames: List[str], rows: List[Dict]):
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(rows)
-
-        logger.info(f"✓ Enhanced {enhanced_count} players")
-        logger.info(f"✓ Wrote {len(rows)} players to {output_file}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description='Enhance roster CSV by scraping player profile pages'
     )
-
-    parser.add_argument(
-        '--input',
-        required=True,
-        help='Input CSV file with existing roster data'
-    )
-
-    parser.add_argument(
-        '--output',
-        required=True,
-        help='Output CSV file for enhanced data'
-    )
-
-    parser.add_argument(
-        '--force',
-        action='store_true',
-        help='Force re-scrape even if row has existing data'
-    )
-
-    parser.add_argument(
-        '--team',
-        help='Only enhance players from this team'
-    )
-
-    parser.add_argument(
-        '--delay',
-        type=float,
-        default=0.5,
-        help='Delay between requests in seconds (default: 0.5)'
-    )
+    parser.add_argument('--input', required=True, help='Input CSV file with existing roster data')
+    parser.add_argument('--output', required=True, help='Output CSV file for enhanced data')
+    parser.add_argument('--force', action='store_true',
+                        help='Force re-scrape even if row has existing data')
+    parser.add_argument('--team', help='Only enhance players from this team')
+    parser.add_argument('--fetch', choices=['auto', 'browser', 'requests'], default='auto',
+                        help='Fetch strategy: auto (browser if available), browser, or requests')
 
     args = parser.parse_args()
 
-    enhancer = ProfileEnhancer(delay=args.delay)
-    enhancer.enhance_csv(args.input, args.output, force=args.force, team_filter=args.team)
+    enhancer = ProfileEnhancer(fetch_mode=args.fetch)
+    try:
+        enhancer.enhance_csv(args.input, args.output, force=args.force, team_filter=args.team)
+    finally:
+        enhancer.close()
 
     print("\n" + "=" * 80)
     print("ENHANCEMENT COMPLETE")
