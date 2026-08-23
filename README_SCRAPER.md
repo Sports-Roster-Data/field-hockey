@@ -43,12 +43,34 @@ Sidearm Sports team sites, which returns 403 to plain HTTP requests.
 - `--fetch browser`: require the browser (error if unavailable).
 - `--fetch requests`: plain HTTP only (fast, but blocked by most team sites).
 
-The browser fetcher blocks images/fonts/media, adds a jittered delay between
-requests, and retries transient failures with backoff.
+The browser fetcher blocks images/fonts/media, adds a short jittered delay
+between requests, and retries transient failures with backoff.
 
 > Note: headless Chromium gets past most, but not necessarily all, bot
 > protection. Measure the real success rate by running against the live team
 > sites from your machine.
+
+## Speed
+
+Roster and profile pages are fetched **concurrently** (one shared browser,
+many pages at once), and profile pages are only fetched **when needed**, so a
+full run takes minutes rather than hours. Controls:
+
+- `--profiles {missing,always,never}` (default `missing`): fetch a player's
+  individual profile page only when the roster list didn't already provide the
+  core fields (position, height, class, hometown). `never` is fastest (roster
+  list only); `always` fetches every profile for maximum completeness.
+- `--concurrency N` (default 6): max page loads in flight at once, across all
+  sites.
+- `--per-host N` (default 3): max concurrent page loads to any single site —
+  keeps profile fetching (which all hits one team's site) polite.
+- `--delay-min` / `--delay-max` (default 0.3 / 0.8s): jittered delay before
+  each fetch.
+
+Rules of thumb: raise `--concurrency` to go faster across many teams; keep
+`--per-host` modest (2–4) to avoid rate-limiting on a single site; use
+`--profiles never` when you only need what's on the roster list. Concurrency
+applies to the browser path; the `requests` fallback stays serial.
 
 ## Usage
 
@@ -70,6 +92,18 @@ uv run src/fhockey_roster_scraper.py --limit 10 --season 2025
 
 ```bash
 uv run src/fhockey_roster_scraper.py --team 457 --season 2025
+```
+
+### Fastest run (skip profile pages)
+
+```bash
+uv run src/fhockey_roster_scraper.py --profiles never --season 2025
+```
+
+### Tune concurrency
+
+```bash
+uv run src/fhockey_roster_scraper.py --concurrency 10 --per-host 3 --season 2025
 ```
 
 ### Plain HTTP instead of a browser

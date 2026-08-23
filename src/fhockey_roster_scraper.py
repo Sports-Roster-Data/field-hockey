@@ -15,18 +15,19 @@ Fetching:
     One-time browser setup on a new machine: `uv run playwright install chromium`.
 """
 
-import os
 import re
 import csv
 import json
 import time
 import random
+import asyncio
+import threading
 import argparse
 import logging
-import subprocess
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -636,10 +637,25 @@ class RequestsFetcher:
         except requests.RequestException as e:
             logger.debug(f"RequestsFetcher warm-up failed for {domain_base}: {e}")
 
-    def fetch(self, url: str, referer: Optional[str] = None, timeout: int = 30) -> Tuple[int, bytes]:
+    def fetch(self, url: str, referer: Optional[str] = None,
+              wait_selector: Optional[str] = None, wait_ms: Optional[int] = None,
+              timeout: int = 30) -> Tuple[int, bytes]:
+        # wait_selector/wait_ms are accepted for API parity with BrowserFetcher
         response = self.session.get(url, headers=self._request_headers(referer),
                                     timeout=timeout, allow_redirects=True)
         return response.status_code, response.content
+
+    def fetch_many(self, items, wait_selector=None, wait_ms=None, concurrency=None):
+        """Serial fetch (the requests fallback does not parallelize)."""
+        results = []
+        for item in items:
+            url, referer = item if isinstance(item, tuple) else (item, None)
+            try:
+                results.append(self.fetch(url, referer=referer))
+            except requests.RequestException as e:
+                logger.warning(f"RequestsFetcher error for {url}: {e}")
+                results.append((0, None))
+        return results
 
     def close(self) -> None:
         try:
@@ -648,100 +664,171 @@ class RequestsFetcher:
             pass
 
 
+ROSTER_WAIT_SELECTOR = 'li.sidearm-roster-player, table.sidearm-table, table'
+PROFILE_WAIT_SELECTOR = '.sidearm-roster-player-bio, table.sidearm-table'
+
+
 class BrowserFetcher:
     """Fetch pages by rendering them in a real headless Chromium via Playwright.
 
-    A single browser + context is reused for the whole run. Images/fonts/media
-    are blocked to speed up loads, and a jittered delay plus limited retries
-    keep the scraper polite and resilient to transient failures.
+    One browser + context is launched on a dedicated asyncio loop (running in a
+    background thread) and reused for the whole run. Pages are fetched
+    concurrently, bounded by a semaphore, so many profile pages can render at
+    once. Images/fonts/media are blocked, a short jittered delay plus limited
+    retries keep the scraper polite and resilient. The public API is synchronous
+    so the rest of the scraper stays simple.
     """
 
     def __init__(self, headless: bool = True, block_assets: bool = True,
-                 min_delay: float = 1.0, max_delay: float = 2.5, retries: int = 2,
-                 nav_timeout_ms: int = 30000, content_wait_ms: int = 5000,
+                 min_delay: float = 0.3, max_delay: float = 0.8, retries: int = 2,
+                 nav_timeout_ms: int = 30000, content_wait_ms: int = 2500,
+                 max_concurrency: int = 6, max_per_host: int = 3,
                  executable_path: Optional[str] = None):
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-        self._PWTimeout = PWTimeout
-
         self.min_delay = min_delay
         self.max_delay = max_delay
         self.retries = retries
         self.nav_timeout_ms = nav_timeout_ms
         self.content_wait_ms = content_wait_ms
+        self.max_concurrency = max(1, max_concurrency)
+        self.max_per_host = max(1, max_per_host)
+        self.pages_fetched = 0
+        self._host_sems: Dict[str, "asyncio.Semaphore"] = {}
 
-        self._pw = sync_playwright().start()
+        # Dedicated event loop on a background thread
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+        self._run(self._async_init(headless, block_assets, executable_path))
+        logger.info(f"BrowserFetcher: launched headless Chromium (max_concurrency={self.max_concurrency})")
+
+    # -- event loop plumbing --------------------------------------------------
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _run(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    async def _async_init(self, headless, block_assets, executable_path) -> None:
+        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+        self._PWTimeout = PWTimeout
+        self._pw = await async_playwright().start()
         launch_kwargs: Dict[str, Any] = {'headless': headless}
         if executable_path:
             launch_kwargs['executable_path'] = executable_path
-        self._browser = self._pw.chromium.launch(**launch_kwargs)
-        self._context = self._browser.new_context(
+        self._browser = await self._pw.chromium.launch(**launch_kwargs)
+        self._context = await self._browser.new_context(
             user_agent=DEFAULT_USER_AGENT,
             viewport={'width': 1366, 'height': 900},
         )
         if block_assets:
-            self._context.route('**/*', self._route)
-        logger.info("BrowserFetcher: launched headless Chromium")
+            await self._context.route('**/*', self._route)
 
     @staticmethod
-    def _route(route):
+    async def _route(route):
         if route.request.resource_type in ('image', 'media', 'font'):
-            route.abort()
+            await route.abort()
         else:
-            route.continue_()
+            await route.continue_()
 
-    def _sleep_politely(self) -> None:
-        if self.max_delay > 0:
-            time.sleep(random.uniform(self.min_delay, self.max_delay))
+    # -- fetching -------------------------------------------------------------
+
+    def _host_sem(self, url: str) -> "asyncio.Semaphore":
+        # Called only from the loop thread, so plain dict access is safe.
+        host = urlparse(url).netloc
+        sem = self._host_sems.get(host)
+        if sem is None:
+            sem = asyncio.Semaphore(self.max_per_host)
+            self._host_sems[host] = sem
+        return sem
+
+    async def _fetch_one(self, sem, url, referer, wait_selector, wait_ms):
+        host_sem = self._host_sem(url)
+        async with sem, host_sem:
+            if self.max_delay > 0:
+                await asyncio.sleep(random.uniform(self.min_delay, self.max_delay))
+
+            last_err = None
+            for attempt in range(self.retries + 1):
+                page = await self._context.new_page()
+                try:
+                    extra = {'referer': referer} if referer else {}
+                    response = await page.goto(url, wait_until='domcontentloaded',
+                                               timeout=self.nav_timeout_ms, **extra)
+                    status = response.status if response else 200
+
+                    # Best-effort bounded wait for content (never a hard tax)
+                    if wait_selector:
+                        try:
+                            await page.wait_for_selector(wait_selector, timeout=wait_ms)
+                        except self._PWTimeout:
+                            pass
+
+                    html = await page.content()
+                    self.pages_fetched += 1
+                    return (status, html)
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"BrowserFetcher error ({attempt + 1}/{self.retries + 1}) for {url}: {e}")
+                finally:
+                    await page.close()
+
+                if attempt < self.retries:
+                    await asyncio.sleep(2 ** attempt)  # exponential backoff
+
+            logger.error(f"BrowserFetcher failed for {url}: {last_err}")
+            return (0, None)
+
+    async def _fetch_many(self, items, wait_selector, wait_ms, concurrency):
+        sem = asyncio.Semaphore(concurrency)
+        tasks = [self._fetch_one(sem, url, referer, wait_selector, wait_ms)
+                 for (url, referer) in items]
+        return await asyncio.gather(*tasks)
+
+    def fetch_many(self, items, wait_selector: Optional[str] = None,
+                   wait_ms: Optional[int] = None, concurrency: Optional[int] = None):
+        """Fetch many URLs concurrently.
+
+        items: list of url strings or (url, referer) tuples.
+        Returns a list of (status, html|None) aligned to the input order.
+        """
+        norm = [(i if isinstance(i, tuple) else (i, None)) for i in items]
+        if not norm:
+            return []
+        wait_ms = self.content_wait_ms if wait_ms is None else wait_ms
+        concurrency = self.max_concurrency if concurrency is None else max(1, concurrency)
+        return self._run(self._fetch_many(norm, wait_selector, wait_ms, concurrency))
+
+    def fetch(self, url: str, referer: Optional[str] = None,
+              wait_selector: Optional[str] = ROSTER_WAIT_SELECTOR,
+              wait_ms: Optional[int] = None) -> Tuple[int, Optional[str]]:
+        return self.fetch_many([(url, referer)], wait_selector=wait_selector,
+                               wait_ms=wait_ms, concurrency=1)[0]
 
     def warm(self, domain_base: str) -> None:
         # Navigation establishes cookies naturally; no separate warm-up needed.
         return
 
-    def fetch(self, url: str, referer: Optional[str] = None,
-              wait_selector: str = 'li.sidearm-roster-player, table') -> Tuple[int, str]:
-        self._sleep_politely()
-        last_err: Optional[Exception] = None
-
-        for attempt in range(self.retries + 1):
-            page = self._context.new_page()
-            try:
-                extra = {'referer': referer} if referer else {}
-                response = page.goto(url, wait_until='domcontentloaded',
-                                     timeout=self.nav_timeout_ms, **extra)
-                status = response.status if response else 200
-
-                # Bounded wait for roster content to render (non-fatal on miss)
-                try:
-                    page.wait_for_selector(wait_selector, timeout=self.content_wait_ms)
-                except self._PWTimeout:
-                    pass
-
-                html = page.content()
-                return status, html
-            except self._PWTimeout as e:
-                last_err = e
-                logger.warning(f"BrowserFetcher timeout ({attempt + 1}/{self.retries + 1}) for {url}")
-            except Exception as e:
-                last_err = e
-                logger.warning(f"BrowserFetcher error ({attempt + 1}/{self.retries + 1}) for {url}: {e}")
-            finally:
-                page.close()
-
-            if attempt < self.retries:
-                time.sleep(2 ** attempt)  # exponential backoff
-
-        raise RuntimeError(f"BrowserFetcher failed after {self.retries + 1} attempts: {last_err}")
+    async def _async_close(self) -> None:
+        await self._context.close()
+        await self._browser.close()
+        await self._pw.stop()
 
     def close(self) -> None:
         try:
-            self._context.close()
-            self._browser.close()
-            self._pw.stop()
+            self._run(self._async_close())
+        except Exception:
+            pass
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=5)
         except Exception:
             pass
 
 
-def build_fetcher(mode: str = 'auto'):
+def build_fetcher(mode: str = 'auto', **browser_kwargs):
     """
     Construct a fetcher.
 
@@ -749,13 +836,16 @@ def build_fetcher(mode: str = 'auto'):
         'browser'  - require Playwright browser rendering
         'requests' - use requests/cloudscraper only
         'auto'     - use the browser if Playwright is importable, else requests
+
+    browser_kwargs are forwarded to BrowserFetcher (e.g. max_concurrency,
+    min_delay, max_delay) and ignored by the requests fetcher.
     """
     if mode == 'requests':
         return RequestsFetcher()
 
     if mode in ('auto', 'browser'):
         try:
-            return BrowserFetcher()
+            return BrowserFetcher(**browser_kwargs)
         except Exception as e:
             if mode == 'browser':
                 raise
@@ -763,7 +853,7 @@ def build_fetcher(mode: str = 'auto'):
             return RequestsFetcher()
 
     logger.warning(f"Unknown fetch mode '{mode}', using auto")
-    return build_fetcher('auto')
+    return build_fetcher('auto', **browser_kwargs)
 
 
 # ============================================================================
@@ -773,108 +863,142 @@ def build_fetcher(mode: str = 'auto'):
 class StandardScraper:
     """Scraper for standard Sidearm Sports sites"""
 
-    def __init__(self, fetcher=None, fetch_mode: str = 'auto', scrape_profiles: bool = True):
+    # Core roster fields; a player is "complete" (no profile fetch needed) when
+    # all of these are present.
+    CORE_FIELDS = ('position', 'height', 'year', 'hometown')
+
+    def __init__(self, fetcher=None, fetch_mode: str = 'auto', profiles_mode: str = 'missing',
+                 scrape_profiles: Optional[bool] = None, concurrency: int = 6,
+                 per_host: int = 3, delay_min: float = 0.3, delay_max: float = 0.8):
         """Initialize scraper
 
         Args:
             fetcher: Optional pre-built fetcher (BrowserFetcher/RequestsFetcher)
             fetch_mode: 'auto' | 'browser' | 'requests' (used if fetcher is None)
-            scrape_profiles: Whether to scrape individual player profile pages
+            profiles_mode: 'missing' (fetch a profile only when core fields are
+                missing), 'always', or 'never'
+            scrape_profiles: Back-compat shim; True -> 'always', False -> 'never'
+            concurrency: max concurrent page loads (global)
+            per_host: max concurrent page loads per site
         """
-        self.fetcher = fetcher if fetcher is not None else build_fetcher(fetch_mode)
-        self.scrape_profiles = scrape_profiles
+        if scrape_profiles is not None:
+            profiles_mode = 'always' if scrape_profiles else 'never'
+        self.profiles_mode = profiles_mode
+
+        if fetcher is not None:
+            self.fetcher = fetcher
+        else:
+            self.fetcher = build_fetcher(
+                fetch_mode, max_concurrency=concurrency, max_per_host=per_host,
+                min_delay=delay_min, max_delay=delay_max,
+            )
 
     def close(self) -> None:
         if self.fetcher:
             self.fetcher.close()
 
+    @classmethod
+    def _needs_profile(cls, player: Player) -> bool:
+        """A player needs a profile fetch if any core field is still empty."""
+        return any(not getattr(player, f, '') for f in cls.CORE_FIELDS)
+
+    @staticmethod
+    def _referer_for(url: str) -> Optional[str]:
+        return url.split('/sports')[0] if '/sports' in url else None
+
     def scrape_team(self, team_id: int, team_name: str, base_url: str, season: str,
                     division: str = "") -> TeamResult:
+        """Scrape a single team (roster + profile enrichment)."""
+        result = self.scrape_rosters(
+            [{'ncaa_id': team_id, 'team': team_name, 'url': base_url}], season, division
+        )[0]
+        if result.status == 'ok':
+            self.enrich_profiles(result.players)
+        return result
+
+    def scrape_rosters(self, teams: List[Dict], season: str, division: str = "") -> List[TeamResult]:
         """
-        Scrape roster for a single team.
+        Fetch and parse roster pages for several teams concurrently (no profile
+        enrichment). Returns a TeamResult per team, aligned to `teams` order.
 
-        Returns a TeamResult carrying the players plus a status
-        (ok | empty | http_error | error) so the caller can report failures
-        accurately instead of conflating them with genuinely empty rosters.
+        404s on the season-specific URL are retried in waves (/roster, then
+        /roster.aspx) so the fallback logic still applies under concurrency.
         """
-        try:
-            # Build roster URL
-            url_format = TeamConfig.get_url_format(team_id, base_url)
-            roster_url = URLBuilder.build_roster_url(base_url, season, url_format)
+        # entries: [team, current_url, referer]
+        entries = []
+        for t in teams:
+            fmt = TeamConfig.get_url_format(t['ncaa_id'], t['url'])
+            url = URLBuilder.build_roster_url(t['url'], season, fmt)
+            entries.append([t, url, self._referer_for(t['url']) or t['url']])
 
-            logger.info(f"Scraping {team_name} - {roster_url}")
+        logger.info(f"Fetching {len(entries)} roster page(s)")
+        results = list(self.fetcher.fetch_many(
+            [(e[1], e[2]) for e in entries], wait_selector=ROSTER_WAIT_SELECTOR))
 
-            domain_base = base_url.split('/sports')[0] if '/sports' in base_url else base_url
+        def retry_wave(indices, suffix):
+            items = [(entries[i][0]['url'].rstrip('/') + suffix, entries[i][2]) for i in indices]
+            waved = self.fetcher.fetch_many(items, wait_selector=ROSTER_WAIT_SELECTOR)
+            for j, i in enumerate(indices):
+                results[i] = waved[j]
+                entries[i][1] = items[j][0]
 
-            # Establish a session (mimic normal browsing) - best effort
-            self.fetcher.warm(domain_base)
+        for suffix in ('/roster', '/roster.aspx'):
+            todo = [i for i, (s, _h) in enumerate(results) if s == 404]
+            if not todo:
+                break
+            logger.info(f"Retrying {len(todo)} team(s) with {suffix}")
+            retry_wave(todo, suffix)
 
-            # Fetch roster page
-            status, content = self.fetcher.fetch(roster_url, referer=domain_base)
+        out = []
+        for (team, url, _ref), (status, html) in zip(entries, results):
+            out.append(self._parse_roster_result(team, season, division, status, html))
+        return out
 
-            # Try alternative URLs if the season-specific page 404s
-            if status == 404:
-                logger.info(f"Got 404, trying /roster without year for {team_name}")
-                alternative_url = f"{base_url.rstrip('/')}/roster"
-                status, content = self.fetcher.fetch(alternative_url, referer=domain_base)
-                if status == 200:
-                    roster_url = alternative_url
-                else:
-                    logger.info(f"Got 404, trying /roster.aspx for {team_name}")
-                    alternative_url = f"{base_url.rstrip('/')}/roster.aspx"
-                    status, content = self.fetcher.fetch(alternative_url, referer=domain_base)
-                    if status == 200:
-                        roster_url = alternative_url
+    def _parse_roster_result(self, team: Dict, season: str, division: str,
+                             status: int, html: Optional[str]) -> TeamResult:
+        team_name = team['team']
+        if status != 200 or not html:
+            logger.warning(f"Failed to retrieve {team_name} - Status: {status}")
+            return TeamResult(players=[], status='http_error', detail=f"HTTP {status}")
 
-            if status != 200:
-                logger.warning(f"Failed to retrieve {team_name} - Status: {status}")
-                return TeamResult(players=[], status='http_error', detail=f"HTTP {status}")
+        soup = BeautifulSoup(html, 'html.parser')
+        if not SeasonVerifier.verify_season_on_page(soup, season):
+            logger.warning(f"Season mismatch for {team_name} (continuing anyway)")
 
-            # Parse HTML
-            html = BeautifulSoup(content, 'html.parser')
+        players = self._extract_players(soup, team['ncaa_id'], team_name, season, division, team['url'])
+        if not players:
+            logger.warning(f"{team_name}: page fetched but no players parsed")
+            return TeamResult(players=[], status='empty', detail='no players parsed')
 
-            # Verify season
-            if not SeasonVerifier.verify_season_on_page(html, season):
-                logger.warning(f"Season mismatch for {team_name} (continuing anyway)")
+        logger.info(f"OK {team_name}: Found {len(players)} players")
+        return TeamResult(players=players, status='ok')
 
-            # Extract players
-            players = self._extract_players(html, team_id, team_name, season, division, base_url)
+    def enrich_profiles(self, players: List[Player]) -> None:
+        """
+        Concurrently fetch profile pages for the given players (in place),
+        subject to profiles_mode. Fetches are bounded by the fetcher's global
+        and per-host concurrency caps.
+        """
+        if self.profiles_mode == 'never':
+            return
 
-            if not players:
-                logger.warning(f"{team_name}: page fetched but no players parsed")
-                return TeamResult(players=[], status='empty', detail='no players parsed')
+        targets = [p for p in players if p.url and
+                   (self.profiles_mode == 'always' or self._needs_profile(p))]
+        if not targets:
+            return
 
-            logger.info(f"OK {team_name}: Found {len(players)} players")
-            return TeamResult(players=players, status='ok')
+        logger.info(f"Enriching {len(targets)} player profile(s)")
+        items = [(p.url, self._referer_for(p.url)) for p in targets]
+        results = self.fetcher.fetch_many(items, wait_selector=PROFILE_WAIT_SELECTOR)
 
-        except requests.RequestException as e:
-            logger.error(f"Request error for {team_name}: {e}")
-            return TeamResult(players=[], status='error', detail=str(e))
-        except Exception as e:
-            logger.error(f"Error scraping {team_name}: {e}")
-            return TeamResult(players=[], status='error', detail=str(e))
-
-    def _scrape_player_profile(self, player: Player) -> Player:
-        """Scrape an individual player profile page for detailed information."""
-        if not player.url:
-            return player
-
-        try:
-            referer = player.url.split('/sports')[0] if '/sports' in player.url else None
-            status, content = self.fetcher.fetch(player.url, referer=referer)
-            if status != 200:
+        for player, (status, html) in zip(targets, results):
+            if status == 200 and html:
+                try:
+                    parse_player_profile(BeautifulSoup(html, 'html.parser'), player)
+                except Exception as e:
+                    logger.warning(f"Error parsing profile for {player.name}: {e}")
+            else:
                 logger.warning(f"Failed to fetch profile for {player.name}: {status}")
-                return player
-
-            html = BeautifulSoup(content, 'html.parser')
-            parse_player_profile(html, player)
-
-        except requests.RequestException as e:
-            logger.warning(f"Request error fetching profile for {player.name}: {e}")
-        except Exception as e:
-            logger.warning(f"Error parsing profile for {player.name}: {e}")
-
-        return player
 
     def _extract_players(self, html, team_id: int, team_name: str, season: str,
                          division: str, base_url: str) -> List[Player]:
@@ -889,8 +1013,6 @@ class StandardScraper:
             # Try table-based format
             return self._extract_players_from_table(html, team_id, team_name, season, division, base_url)
 
-        domain = URLBuilder.domain_for_url(base_url)
-
         for item in roster_items:
             try:
                 # Jersey number
@@ -903,7 +1025,7 @@ class StandardScraper:
                     name_link = name_elem.find('a', href=True)
                     if name_link:
                         name = FieldExtractors.clean_text(name_link.get_text())
-                        profile_url = self._absolute_url(name_link['href'], domain)
+                        profile_url = self._absolute_url(base_url, name_link['href'])
                     else:
                         name = FieldExtractors.clean_text(name_elem.get_text())
                         profile_url = ''
@@ -956,9 +1078,6 @@ class StandardScraper:
                     url=profile_url,
                 )
 
-                if self.scrape_profiles and profile_url:
-                    player = self._scrape_player_profile(player)
-
                 players.append(player)
 
             except Exception as e:
@@ -968,14 +1087,15 @@ class StandardScraper:
         return players
 
     @staticmethod
-    def _absolute_url(rel_url: str, domain: str) -> str:
-        if not rel_url:
+    def _absolute_url(base_url: str, href: str) -> str:
+        """Resolve a possibly-relative href against the roster page URL.
+
+        Uses urljoin so the scheme/host/port are preserved correctly (more
+        robust than reconstructing the host by hand).
+        """
+        if not href:
             return ''
-        if rel_url.startswith('http'):
-            return rel_url
-        if rel_url.startswith('/'):
-            return f"https://{domain}{rel_url}"
-        return f"https://{domain}/{rel_url}"
+        return urljoin(base_url if base_url.endswith('/') else base_url + '/', href)
 
     @staticmethod
     def _row_is_header(row) -> bool:
@@ -995,8 +1115,6 @@ class StandardScraper:
         if not table:
             logger.warning(f"No table found for {team_name}")
             return players
-
-        domain = URLBuilder.domain_for_url(base_url)
 
         # Find header row to map columns
         header_row = table.find('thead')
@@ -1049,7 +1167,7 @@ class StandardScraper:
                     name_link = name_cell.find('a', href=True)
                     if name_link:
                         name = FieldExtractors.clean_text(name_link.get_text())
-                        profile_url = self._absolute_url(name_link['href'], domain)
+                        profile_url = self._absolute_url(base_url, name_link['href'])
                     else:
                         name = FieldExtractors.clean_text(name_cell.get_text())
 
@@ -1103,9 +1221,6 @@ class StandardScraper:
                     url=profile_url,
                 )
 
-                if self.scrape_profiles and profile_url:
-                    player = self._scrape_player_profile(player)
-
                 players.append(player)
 
             except Exception as e:
@@ -1123,10 +1238,17 @@ class RosterManager:
     """Manages batch scraping of rosters with error tracking and caching."""
 
     def __init__(self, season: str = '2025', output_dir: str = None,
-                 scrape_profiles: bool = True, fetch_mode: str = 'auto'):
+                 profiles_mode: str = 'missing', fetch_mode: str = 'auto',
+                 concurrency: int = 6, per_host: int = 3,
+                 delay_min: float = 0.3, delay_max: float = 0.8):
         self.season = season
         self.output_dir = Path(output_dir) if output_dir else (REPO_ROOT / 'data' / 'raw')
-        self.scraper = StandardScraper(fetch_mode=fetch_mode, scrape_profiles=scrape_profiles)
+        self.concurrency = max(1, concurrency)
+        self.scraper = StandardScraper(
+            fetch_mode=fetch_mode, profiles_mode=profiles_mode,
+            concurrency=concurrency, per_host=per_host,
+            delay_min=delay_min, delay_max=delay_max,
+        )
 
         # Error tracking
         self.zero_player_teams = []
@@ -1154,6 +1276,36 @@ class RosterManager:
     def _cache_file(self, team_id: int) -> Path:
         return self.output_dir / 'teams' / f'{team_id}_{self.season}.json'
 
+    def _load_cache(self, team: Dict) -> Optional[Dict]:
+        """Return cached data for a team if it is a settled (ok/empty) result.
+
+        Prior failures return None so they are retried automatically.
+        """
+        cache_file = self._cache_file(team['ncaa_id'])
+        if not cache_file.exists():
+            return None
+        try:
+            with open(cache_file) as f:
+                cached = json.load(f)
+        except Exception as e:
+            logger.warning(f"  Cache read failed for {team['team']}, re-scraping: {e}")
+            return None
+        if cached.get('status') in ('ok', 'empty'):
+            return cached
+        logger.info(f"  Retrying previously failed team (cached status={cached.get('status')})")
+        return None
+
+    def _write_cache(self, team: Dict, result: "TeamResult", player_dicts: List[Dict]) -> None:
+        try:
+            with open(self._cache_file(team['ncaa_id']), 'w') as f:
+                json.dump({
+                    'team': team['team'], 'ncaa_id': team['ncaa_id'], 'url': team['url'],
+                    'status': result.status, 'detail': result.detail,
+                    'player_count': len(player_dicts), 'players': player_dicts,
+                }, f, indent=2)
+        except Exception as e:
+            logger.warning(f"  Failed to write cache for {team['team']}: {e}")
+
     def scrape_teams(self, teams: List[Dict], max_teams: Optional[int] = None,
                      refresh: bool = False) -> List[Dict]:
         """
@@ -1167,54 +1319,42 @@ class RosterManager:
 
         (self.output_dir / 'teams').mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Starting scrape of {len(teams_to_scrape)} teams")
+        logger.info(f"Starting scrape of {len(teams_to_scrape)} teams "
+                    f"(concurrency={self.concurrency})")
         logger.info("=" * 80)
 
-        for i, team in enumerate(teams_to_scrape, 1):
-            team_id = team['ncaa_id']
-            team_name = team['team']
-            team_url = team['url']
+        # Process teams in batches; roster pages and profiles within a batch are
+        # fetched concurrently (bounded by the fetcher's global/per-host caps).
+        for start in range(0, len(teams_to_scrape), self.concurrency):
+            batch = teams_to_scrape[start:start + self.concurrency]
 
-            logger.info(f"[{i}/{len(teams_to_scrape)}] {team_name}")
+            # Serve settled teams straight from cache; scrape the rest.
+            pending: List[Dict] = []
+            for offset, team in enumerate(batch, start=start + 1):
+                logger.info(f"[{offset}/{len(teams_to_scrape)}] {team['team']}")
+                cached = self._load_cache(team) if not refresh else None
+                if cached is not None:
+                    status = cached.get('status', 'empty')
+                    logger.info(f"  (cached) status={status} players={cached.get('player_count', 0)}")
+                    self._record(team, status, cached.get('players', []), cached.get('detail', ''))
+                    all_player_dicts.extend(cached.get('players', []))
+                else:
+                    pending.append(team)
 
-            cache_file = self._cache_file(team_id)
-            if not refresh and cache_file.exists():
-                try:
-                    with open(cache_file) as f:
-                        cached = json.load(f)
-                    cached_status = cached.get('status', 'empty')
-                    # Reuse only settled results; retry prior failures automatically
-                    # (use --refresh to also re-scrape successful teams).
-                    if cached_status in ('ok', 'empty'):
-                        logger.info(f"  (cached) status={cached_status} "
-                                    f"players={cached.get('player_count', 0)}")
-                        self._record(team, cached_status,
-                                     cached.get('players', []), cached.get('detail', ''))
-                        all_player_dicts.extend(cached.get('players', []))
-                        continue
-                    logger.info(f"  Retrying previously failed team (cached status={cached_status})")
-                except Exception as e:
-                    logger.warning(f"  Cache read failed for {team_name}, re-scraping: {e}")
+            if not pending:
+                continue
 
-            result = self.scraper.scrape_team(
-                team_id=team_id, team_name=team_name, base_url=team_url,
-                season=self.season, division="",
-            )
-            player_dicts = [p.to_dict() for p in result.players]
+            results = self.scraper.scrape_rosters(pending, self.season)
 
-            # Persist per-team cache
-            try:
-                with open(cache_file, 'w') as f:
-                    json.dump({
-                        'team': team_name, 'ncaa_id': team_id, 'url': team_url,
-                        'status': result.status, 'detail': result.detail,
-                        'player_count': len(player_dicts), 'players': player_dicts,
-                    }, f, indent=2)
-            except Exception as e:
-                logger.warning(f"  Failed to write cache for {team_name}: {e}")
+            # Enrich profiles for the whole batch in one concurrent pass
+            batch_players = [p for r in results for p in r.players]
+            self.scraper.enrich_profiles(batch_players)
 
-            self._record(team, result.status, player_dicts, result.detail)
-            all_player_dicts.extend(player_dicts)
+            for team, result in zip(pending, results):
+                player_dicts = [p.to_dict() for p in result.players]
+                self._write_cache(team, result, player_dicts)
+                self._record(team, result.status, player_dicts, result.detail)
+                all_player_dicts.extend(player_dicts)
 
         logger.info("=" * 80)
         logger.info("Scraping complete:")
@@ -1313,6 +1453,9 @@ Examples:
   # Scrape specific team
   uv run src/fhockey_roster_scraper.py --team 457 --season 2025
 
+  # Faster: skip profile pages entirely (roster list only)
+  uv run src/fhockey_roster_scraper.py --profiles never --season 2025
+
   # Force plain HTTP instead of a browser
   uv run src/fhockey_roster_scraper.py --fetch requests --season 2025
         """
@@ -1329,13 +1472,28 @@ Examples:
                         help='Fetch strategy: auto (browser if available), browser, or requests')
     parser.add_argument('--refresh', action='store_true',
                         help='Ignore cached per-team results and re-scrape')
-    parser.add_argument('--scrape-profiles', action=argparse.BooleanOptionalAction, default=True,
-                        help='Scrape individual player profile pages (default: on)')
+    parser.add_argument('--profiles', choices=['missing', 'always', 'never'], default='missing',
+                        help="When to fetch player profile pages: 'missing' (only when the "
+                             "roster omits core fields; default), 'always', or 'never' (fastest)")
+    # Back-compat alias: --no-scrape-profiles == --profiles never
+    parser.add_argument('--no-scrape-profiles', dest='profiles', action='store_const',
+                        const='never', help=argparse.SUPPRESS)
+    parser.add_argument('--concurrency', type=int, default=6,
+                        help='Max concurrent page loads, global (default: 6)')
+    parser.add_argument('--per-host', type=int, default=3,
+                        help='Max concurrent page loads per site, e.g. profiles (default: 3)')
+    parser.add_argument('--delay-min', type=float, default=0.3,
+                        help='Minimum jittered delay before each fetch, seconds (default: 0.3)')
+    parser.add_argument('--delay-max', type=float, default=0.8,
+                        help='Maximum jittered delay before each fetch, seconds (default: 0.8)')
 
     args = parser.parse_args()
 
+    start_time = time.time()
     manager = RosterManager(season=args.season, output_dir=args.output_dir,
-                            scrape_profiles=args.scrape_profiles, fetch_mode=args.fetch)
+                            profiles_mode=args.profiles, fetch_mode=args.fetch,
+                            concurrency=args.concurrency, per_host=args.per_host,
+                            delay_min=args.delay_min, delay_max=args.delay_max)
 
     try:
         teams = manager.load_teams(args.teams_csv)
@@ -1371,6 +1529,8 @@ Examples:
     print(f"Total players: {len(player_dicts)}")
     print(f"Zero players: {len(manager.zero_player_teams)} teams")
     print(f"Failed: {len(manager.failed_teams)} teams")
+    print(f"Pages fetched: {getattr(manager.scraper.fetcher, 'pages_fetched', 'n/a')}")
+    print(f"Elapsed: {time.time() - start_time:.1f}s")
     print("=" * 80)
 
 

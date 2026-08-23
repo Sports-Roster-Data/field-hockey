@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fhockey_roster_scraper import (  # noqa: E402
     parse_player_profile,
     build_fetcher,
+    PROFILE_WAIT_SELECTOR,
 )
 
 # Configure logging
@@ -29,55 +30,33 @@ logger = logging.getLogger(__name__)
 
 
 class ProfileEnhancer:
-    """Enhance roster data by scraping individual player profiles."""
+    """Enhance roster data by scraping player profiles concurrently."""
 
-    def __init__(self, fetch_mode: str = 'auto'):
-        self.fetcher = build_fetcher(fetch_mode)
+    def __init__(self, fetch_mode: str = 'auto', concurrency: int = 6, per_host: int = 3,
+                 delay_min: float = 0.3, delay_max: float = 0.8):
+        self.fetcher = build_fetcher(
+            fetch_mode, max_concurrency=concurrency, max_per_host=per_host,
+            min_delay=delay_min, max_delay=delay_max,
+        )
 
     def close(self):
         self.fetcher.close()
 
-    def scrape_player_profile(self, row: Dict, force: bool = False) -> bool:
-        """
-        Scrape a player profile and fill missing fields in `row` (in place).
-
-        Returns True if the row was modified.
-        """
-        url = (row.get('url') or '').strip()
-        if not url:
+    @staticmethod
+    def _needs_enhance(row: Dict, force: bool) -> bool:
+        if not (row.get('url') or '').strip():
             return False
-
-        # Skip if the row already has the core fields (unless force)
-        if not force:
-            has_data = any([row.get('position'), row.get('height'),
-                            row.get('class'), row.get('hometown')])
-            if has_data:
-                logger.debug(f"Skipping {row.get('name')} - already has data")
-                return False
-
-        try:
-            referer = url.split('/sports')[0] if '/sports' in url else None
-            status, content = self.fetcher.fetch(url, referer=referer)
-            if status != 200:
-                logger.warning(f"Failed to fetch {url}: {status}")
-                return False
-
-            html = BeautifulSoup(content, 'html.parser')
-            changed = parse_player_profile(html, row)
-            if changed:
-                logger.info(f"OK Enhanced {row.get('name', 'Unknown')}")
-            return changed
-
-        except Exception as e:
-            logger.warning(f"Error processing {url}: {e}")
-            return False
+        if force:
+            return True
+        # Skip rows that already have the core fields
+        return not any([row.get('position'), row.get('height'),
+                        row.get('class'), row.get('hometown')])
 
     def enhance_csv(self, input_file: str, output_file: str, force: bool = False,
-                    team_filter: Optional[str] = None, checkpoint_every: int = 25):
+                    team_filter: Optional[str] = None):
         """
-        Read a roster CSV, enhance rows from their profile pages, and write the
-        result. Output is written incrementally (checkpointed) so a crash does
-        not discard completed work.
+        Read a roster CSV, enhance rows from their profile pages concurrently,
+        and write the result. The output is written atomically at the end.
         """
         rows: List[Dict] = []
         with open(input_file, 'r', encoding='utf-8') as f:
@@ -100,33 +79,41 @@ class ProfileEnhancer:
             if k not in fieldnames:
                 fieldnames.append(k)
 
+        # Select rows to enhance and fetch their profiles concurrently
+        targets = [r for r in rows if self._needs_enhance(r, force)]
+        logger.info(f"Fetching {len(targets)} profile page(s)")
+
         enhanced_count = 0
+        if targets:
+            def referer_for(url):
+                url = url.strip()
+                return url.split('/sports')[0] if '/sports' in url else None
+
+            items = [(r['url'].strip(), referer_for(r['url'])) for r in targets]
+            results = self.fetcher.fetch_many(items, wait_selector=PROFILE_WAIT_SELECTOR)
+
+            for row, (status, html) in zip(targets, results):
+                if status == 200 and html:
+                    try:
+                        if parse_player_profile(BeautifulSoup(html, 'html.parser'), row):
+                            enhanced_count += 1
+                            logger.info(f"OK Enhanced {row.get('name', 'Unknown')}")
+                    except Exception as e:
+                        logger.warning(f"Error parsing {row.get('url')}: {e}")
+                else:
+                    logger.warning(f"Failed to fetch {row.get('url')}: {status}")
+
+        # Atomic write
         output_path = Path(output_file)
         tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
-
-        for i, row in enumerate(rows, 1):
-            logger.info(f"[{i}/{len(rows)}] Processing {row.get('team')} - {row.get('name')}")
-            if self.scrape_player_profile(row, force=force):
-                enhanced_count += 1
-
-            # Checkpoint: flush progress to a temp file periodically
-            if checkpoint_every and i % checkpoint_every == 0:
-                self._write_rows(tmp_path, fieldnames, rows)
-                logger.info(f"  Checkpoint written ({i}/{len(rows)})")
-
-        # Final write, then atomically move into place
-        self._write_rows(tmp_path, fieldnames, rows)
+        with open(tmp_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(rows)
         tmp_path.replace(output_path)
 
         logger.info(f"OK Enhanced {enhanced_count} players")
         logger.info(f"OK Wrote {len(rows)} players to {output_file}")
-
-    @staticmethod
-    def _write_rows(path: Path, fieldnames: List[str], rows: List[Dict]):
-        with open(path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(rows)
 
 
 def main():
@@ -140,10 +127,15 @@ def main():
     parser.add_argument('--team', help='Only enhance players from this team')
     parser.add_argument('--fetch', choices=['auto', 'browser', 'requests'], default='auto',
                         help='Fetch strategy: auto (browser if available), browser, or requests')
+    parser.add_argument('--concurrency', type=int, default=6,
+                        help='Max concurrent page loads, global (default: 6)')
+    parser.add_argument('--per-host', type=int, default=3,
+                        help='Max concurrent page loads per site (default: 3)')
 
     args = parser.parse_args()
 
-    enhancer = ProfileEnhancer(fetch_mode=args.fetch)
+    enhancer = ProfileEnhancer(fetch_mode=args.fetch, concurrency=args.concurrency,
+                               per_host=args.per_host)
     try:
         enhancer.enhance_csv(args.input, args.output, force=args.force, team_filter=args.team)
     finally:
