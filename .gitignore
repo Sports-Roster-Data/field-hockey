@@ -5,6 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
+*DS_Store
 
 # Distribution / packaging
 .Python
@@ -205,6 +206,3 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-
-# Scraper output (generated)
-data/raw/

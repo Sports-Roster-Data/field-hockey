@@ -1,0 +1,42 @@
+{
+  "team": "Hofstra",
+  "ncaa_id": 283,
+  "url": "https://gohofstra.com/sports/field-hockey",
+  "status": "ok",
+  "detail": "",
+  "player_count": 2,
+  "players": [
+    {
+      "team": "Hofstra",
+      "season": "2025",
+      "division": "",
+      "name": "",
+      "jersey": "",
+      "position": "",
+      "height": "",
+      "major": "",
+      "hometown": "",
+      "high_school": "",
+      "previous_school": "",
+      "url": "",
+      "class": "",
+      "ncaa_id": 283
+    },
+    {
+      "team": "Hofstra",
+      "season": "2025",
+      "division": "",
+      "name": "",
+      "jersey": "",
+      "position": "",
+      "height": "",
+      "major": "",
+      "hometown": "",
+      "high_school": "",
+      "previous_school": "",
+      "url": "",
+      "class": "",
+      "ncaa_id": 283
+    }
+  ]
+}
