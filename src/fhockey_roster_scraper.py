@@ -255,7 +255,35 @@ class FieldExtractors:
             if k.rstrip('.').lower() == key.lower():
                 return v
 
+        # "4th Year" / "First Year" style: strip a trailing "year" and retry.
+        stripped = re.sub(r'\s*years?\s*$', '', key, flags=re.IGNORECASE).strip()
+        if stripped and stripped.lower() != key.lower():
+            for k, v in year_map.items():
+                if k.rstrip('.').lower() == stripped.lower():
+                    return v
+
         return year_text
+
+    # Full academic-year forms, used to classify unlabeled roster values.
+    _YEAR_FORMS = {
+        'freshman', 'sophomore', 'junior', 'senior', 'graduate',
+        'redshirt freshman', 'redshirt sophomore', 'redshirt junior',
+        'redshirt senior',
+    }
+
+    @staticmethod
+    def looks_like_year(text: str) -> bool:
+        """True if the text is (or abbreviates to) an academic year.
+
+        Used for card layouts that render height and class as unlabeled,
+        order-dependent values.
+        """
+        if not text:
+            return False
+        cleaned = FieldExtractors.clean_text(text)
+        if cleaned.lower() in FieldExtractors._YEAR_FORMS:
+            return True
+        return FieldExtractors.normalize_academic_year(cleaned) != cleaned
 
     @staticmethod
     def extract_hometown_parts(hometown_text: str) -> tuple:
@@ -664,7 +692,13 @@ class RequestsFetcher:
             pass
 
 
-ROSTER_WAIT_SELECTOR = 'li.sidearm-roster-player, table.sidearm-table, table'
+# Wait for roster-specific content to render. A bare `table` is deliberately
+# excluded: it matches stray page tables (nav/footer) in the initial HTML and
+# would let the wait return before a Vue/JS roster mounts.
+ROSTER_WAIT_SELECTOR = (
+    'li.sidearm-roster-player, li.roster-list-item, .roster-card-item, '
+    '.s-person-card, table.sidearm-table'
+)
 PROFILE_WAIT_SELECTOR = '.sidearm-roster-player-bio, table.sidearm-table'
 
 
@@ -942,7 +976,9 @@ class StandardScraper:
                 results[i] = waved[j]
                 entries[i][1] = items[j][0]
 
-        for suffix in ('/roster', '/roster.aspx'):
+        # Modern Sidearm sites serve season rosters at /roster/season/<year>;
+        # try that before the bare /roster (current season) and legacy .aspx.
+        for suffix in (f'/roster/season/{season}', '/roster', '/roster.aspx'):
             todo = [i for i, (s, _h) in enumerate(results) if s == 404]
             if not todo:
                 break
@@ -1005,10 +1041,17 @@ class StandardScraper:
         """Extract players from HTML"""
         players = []
 
-        # Find all player list items (Sidearm pattern)
+        # Find all player list items (classic Sidearm pattern)
         roster_items = html.find_all('li', class_='sidearm-roster-player')
 
         if not roster_items:
+            # Modern Sidearm layouts replaced the classic markup on many sites.
+            # Try each newer layout, then fall back to a generic table.
+            for extractor in (self._extract_list_items, self._extract_card_items,
+                              self._extract_person_cards):
+                players = extractor(html, team_id, team_name, season, division, base_url)
+                if players:
+                    return players
             logger.warning(f"No roster items found for {team_name} (expected class='sidearm-roster-player')")
             # Try table-based format
             return self._extract_players_from_table(html, team_id, team_name, season, division, base_url)
@@ -1096,6 +1139,213 @@ class StandardScraper:
         if not href:
             return ''
         return urljoin(base_url if base_url.endswith('/') else base_url + '/', href)
+
+    def _extract_list_items(self, html, team_id, team_name, season, division, base_url):
+        """Extract players from the modern Sidearm list layout.
+
+        Player is ``li.roster-list-item``; the name/profile link is
+        ``a.roster-list-item__title`` and each bio field is a
+        ``roster-player-list-profile-field`` element whose ``--modifier`` class
+        (e.g. ``--class-level``, ``--position``, ``--hometown``) names the field.
+        """
+        players = []
+        for item in html.find_all('li', class_='roster-list-item'):
+            try:
+                jersey_elem = item.find(class_='roster-list-item__jersey-number')
+                jersey = FieldExtractors.extract_jersey_number(
+                    FieldExtractors.clean_text(jersey_elem.get_text())) if jersey_elem else ''
+                # Coaches/staff share this markup but carry no jersey number.
+                if not jersey:
+                    continue
+
+                name_link = item.find('a', class_='roster-list-item__title', href=True)
+                if not name_link:
+                    continue
+                name = FieldExtractors.clean_text(name_link.get_text())
+                profile_url = self._absolute_url(base_url, name_link['href'])
+
+                player = Player(team_id=team_id, team=team_name, season=season,
+                                division=division, name=name, jersey=jersey, url=profile_url)
+
+                for fld in item.find_all(class_='roster-player-list-profile-field'):
+                    modifier = next((c.split('--', 1)[1] for c in (fld.get('class') or [])
+                                     if '--' in c), '')
+                    if modifier:
+                        FieldExtractors.apply_bio_field(player, modifier.replace('-', ' '),
+                                                        fld.get_text())
+                players.append(player)
+            except Exception as e:
+                logger.warning(f"Error parsing list item in {team_name}: {e}")
+        return players
+
+    def _extract_card_items(self, html, team_id, team_name, season, division, base_url):
+        """Extract players from the modern Sidearm card layout.
+
+        Player is ``.roster-card-item``; name is ``a.roster-card-item__title-link``,
+        position (which may be multi-position, e.g. ``M/F``) is
+        ``.roster-card-item__position``, and remaining bio fields are
+        ``span.profile-field-content`` (title/value) pairs.
+        """
+        players = []
+        for item in html.find_all(class_='roster-card-item'):
+            try:
+                # Name/profile link: sites use either __title-link or the
+                # __title--link modifier on the title anchor.
+                name_link = (item.find('a', class_='roster-card-item__title-link', href=True)
+                             or item.find('a', class_='roster-card-item__title--link', href=True)
+                             or item.find('a', class_='roster-card-item__title', href=True))
+                if not name_link:
+                    continue
+                name = FieldExtractors.clean_text(name_link.get_text())
+                profile_url = self._absolute_url(base_url, name_link['href'])
+
+                # Jersey lives under one of several class names across variants.
+                jersey_elem = item.find(class_=['roster-card-item__jersey-number',
+                                                'roster-card-jersey-number',
+                                                'roster-card-item__number'])
+                jersey = FieldExtractors.extract_jersey_number(
+                    FieldExtractors.clean_text(jersey_elem.get_text())) if jersey_elem else ''
+                # Coaches/staff share this markup but carry no jersey number.
+                if not jersey:
+                    continue
+
+                player = Player(team_id=team_id, team=team_name, season=season,
+                                division=division, name=name, jersey=jersey, url=profile_url)
+
+                pos_elem = item.find(class_='roster-card-item__position')
+                if pos_elem:
+                    raw_pos = FieldExtractors.clean_text(pos_elem.get_text())
+                    # Preserve multi-position codes (e.g. "D/M"); normalize a
+                    # single full-word/abbrev position (e.g. "Back" -> "D").
+                    player.position = raw_pos if '/' in raw_pos else \
+                        (FieldExtractors.extract_position(raw_pos) or raw_pos)
+
+                # Field markup A: span.profile-field-content (title/value pairs).
+                for field_el in item.find_all(class_='profile-field-content'):
+                    label_el = field_el.find(class_='profile-field-content__title')
+                    value_el = field_el.find(class_='profile-field-content__value')
+                    if label_el and value_el:
+                        FieldExtractors.apply_bio_field(player, label_el.get_text(),
+                                                        value_el.get_text())
+
+                # Field markup B: div.roster-player-card-profile-field, where a
+                # field is either labeled (__label + __value) or a run of
+                # unlabeled, order-independent __value spans (height, class).
+                for field_el in item.find_all(class_='roster-player-card-profile-field'):
+                    label_el = field_el.find(class_='roster-player-card-profile-field__label')
+                    values = field_el.find_all(class_='roster-player-card-profile-field__value')
+                    if label_el:
+                        for v in values:
+                            FieldExtractors.apply_bio_field(player, label_el.get_text(), v.get_text())
+                    else:
+                        for v in values:
+                            self._apply_unlabeled_value(player, v.get_text())
+
+                # Field markup C: div.roster-card-component__profile-box holding
+                # bare, unlabeled <strong>/<span> values (position, class, then
+                # hometown, high school) in document order.
+                for box in item.find_all(class_='roster-card-component__profile-box'):
+                    for v in box.find_all(['strong', 'span']):
+                        self._apply_unlabeled_value(player, v.get_text())
+                players.append(player)
+            except Exception as e:
+                logger.warning(f"Error parsing card item in {team_name}: {e}")
+        return players
+
+    @staticmethod
+    def _apply_unlabeled_value(player: Player, value: str) -> None:
+        """Classify an unlabeled, order-dependent roster value by its content.
+
+        Card layouts that omit field labels render values (height, class,
+        position, hometown, high school) as bare spans. Each is classified by
+        shape and written only to a still-empty field.
+        """
+        value = FieldExtractors.clean_text(value)
+        if not value:
+            return
+        # Height, e.g. 5'5" / 1.72m
+        if not player.height and FieldExtractors.extract_height(value):
+            player.height = FieldExtractors.extract_height(value)
+            return
+        # Academic year, e.g. "Junior", "4th Year"
+        if not player.year and FieldExtractors.looks_like_year(value):
+            player.year = FieldExtractors.normalize_academic_year(value)
+            return
+        # Position: a short, comma-free code/word (e.g. "Defender", "D/M")
+        if not player.position and ',' not in value and len(value) <= 20:
+            pos = FieldExtractors.extract_position(value)
+            if pos:
+                player.position = value if '/' in value else pos
+                return
+        # Hometown: "City, State" style (contains a comma)
+        if not player.hometown and ',' in value:
+            hometown, hs = FieldExtractors.extract_hometown_parts(value)
+            if hometown:
+                player.hometown = hometown
+            if hs and not player.high_school:
+                player.high_school = hs
+            return
+        # High school: a leftover value that follows a hometown in the same group
+        if not player.high_school and player.hometown:
+            player.high_school = value
+
+    def _extract_person_cards(self, html, team_id, team_name, season, division, base_url):
+        """Extract players from the Sidearm ``s-person-card`` design-system layout.
+
+        Only cards inside ``.c-rosterpage__players`` are players (coaches and
+        support staff use the same card elsewhere on the page). Each bio field is
+        an element with an inner ``.sr-only`` label followed by the value text.
+        """
+        container = html.find(class_='c-rosterpage__players') or html
+        players = []
+        seen = set()
+        for item in container.find_all(class_='s-person-card'):
+            try:
+                name_link = item.find('a', href=True)
+                heading = item.find('h3')
+                if not (name_link and heading):
+                    continue
+                name = FieldExtractors.clean_text(heading.get_text())
+                profile_url = self._absolute_url(base_url, name_link['href'])
+                if profile_url in seen:
+                    continue
+                seen.add(profile_url)
+
+                # This card design is shared by players and staff (coaches,
+                # support). Players carry a jersey-number stamp; staff do not, so
+                # a missing jersey number is the signal to skip a non-player card.
+                stamp = item.find(class_='s-stamp__text')
+                jersey = FieldExtractors.extract_jersey_number(
+                    FieldExtractors.clean_text(self._text_without_sr_only(stamp))) if stamp else ''
+                if not jersey:
+                    continue
+
+                player = Player(team_id=team_id, team=team_name, season=season,
+                                division=division, name=name, jersey=jersey, url=profile_url)
+
+                # Each bio field is a leaf element carrying its own .sr-only
+                # label; several such leaves may share a container (hometown,
+                # last school, major), so read the label from each leaf. Labels
+                # apply_bio_field does not recognize (jersey, social links) are
+                # ignored, so a blanket sweep of sr-only labels is safe.
+                for label_el in item.find_all(class_='sr-only'):
+                    leaf = label_el.parent
+                    if leaf is None:
+                        continue
+                    value = self._text_without_sr_only(leaf)
+                    FieldExtractors.apply_bio_field(player, label_el.get_text(), value)
+                players.append(player)
+            except Exception as e:
+                logger.warning(f"Error parsing person card in {team_name}: {e}")
+        return players
+
+    @staticmethod
+    def _text_without_sr_only(element) -> str:
+        """Return an element's text with any nested ``.sr-only`` labels removed."""
+        clone = BeautifulSoup(str(element), 'html.parser')
+        for sr in clone.find_all(class_='sr-only'):
+            sr.decompose()
+        return FieldExtractors.clean_text(clone.get_text())
 
     @staticmethod
     def _row_is_header(row) -> bool:
