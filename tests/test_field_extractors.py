@@ -120,3 +120,27 @@ def test_dedupe_school_fields_prefers_high_school():
     row = {"high_school": "Erasmiaans Gymnasium", "previous_school": "ERASMIAANS GYMNASIUM"}
     assert FE.dedupe_school_fields(row) is True
     assert row == {"high_school": "Erasmiaans Gymnasium", "previous_school": ""}
+
+
+@pytest.mark.parametrize("previous,high_school,remaining_previous", [
+    ("Woodgrove HS", "Woodgrove HS", ""),
+    ("Leigh High School", "Leigh High School", ""),
+    ("Tabor Academy", "Tabor Academy", ""),
+    ("Twin Valley HS / Liberty", "Twin Valley HS", "Liberty"),
+    ("Duchesne Academy (UC Davis)", "Duchesne Academy", "UC Davis"),
+])
+def test_reclassify_explicit_high_school_from_previous(
+        previous, high_school, remaining_previous):
+    row = {"high_school": "", "previous_school": previous}
+    assert FE.reclassify_high_school_from_previous(row) is True
+    assert row["high_school"] == high_school
+    assert row["previous_school"] == remaining_previous
+
+
+@pytest.mark.parametrize("previous", [
+    "University of Maryland", "Rider University", "Palmyra", "Boston College",
+])
+def test_reclassify_leaves_ambiguous_or_college_values(previous):
+    row = {"high_school": "", "previous_school": previous}
+    assert FE.reclassify_high_school_from_previous(row) is False
+    assert row == {"high_school": "", "previous_school": previous}

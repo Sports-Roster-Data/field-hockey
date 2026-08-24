@@ -149,6 +149,56 @@ class FieldExtractors:
         return True
 
     @staticmethod
+    def reclassify_high_school_from_previous(store) -> bool:
+        """Move an explicitly high-school-like previous_school value.
+
+        Ambiguous bare school names and generic colleges are deliberately left
+        alone. Combined values retain the transfer institution in
+        previous_school, e.g. ``Twin Valley HS / Liberty``.
+        """
+        is_dict = isinstance(store, dict)
+
+        def get(field_name: str) -> str:
+            return ((store.get(field_name) or '') if is_dict
+                    else (getattr(store, field_name, '') or ''))
+
+        def put(field_name: str, value: str) -> None:
+            if is_dict:
+                store[field_name] = value
+            else:
+                setattr(store, field_name, value)
+
+        if get('high_school') or not get('previous_school'):
+            return False
+        value = FieldExtractors.clean_text(get('previous_school'))
+        marker = (
+            r'(?:\bH\.?S\.?\b|High School|Secondary School|Grammar School|'
+            r'Preparatory School|Prep School|Academy|Gymnasium|Lyceum|'
+            r'\bSchool(?:\s+of\b|\b))'
+        )
+        if not re.search(marker, value, re.IGNORECASE):
+            return False
+
+        slash = re.match(rf'^(.+?{marker})\s*/\s*(.+)$', value, re.IGNORECASE)
+        if slash:
+            put('high_school', FieldExtractors.clean_text(slash.group(1)))
+            put('previous_school', FieldExtractors.clean_text(slash.group(2)))
+            return True
+
+        transfer_suffix = re.match(
+            rf'^(.+?{marker})\s+\(((?:UC\s+.+)|(?:.*University.*))\)$',
+            value, re.IGNORECASE,
+        )
+        if transfer_suffix:
+            put('high_school', FieldExtractors.clean_text(transfer_suffix.group(1)))
+            put('previous_school', FieldExtractors.clean_text(transfer_suffix.group(2)))
+            return True
+
+        put('high_school', value)
+        put('previous_school', '')
+        return True
+
+    @staticmethod
     def extract_jersey_number(text: str) -> str:
         """Extract jersey number from various text patterns"""
         if not text:
@@ -533,6 +583,8 @@ def parse_player_profile(html, store, audit: Optional[Dict[str, Any]] = None) ->
                         'evidence': evidence,
                     }
 
+    if FieldExtractors.reclassify_high_school_from_previous(store):
+        changed = True
     if FieldExtractors.dedupe_school_fields(store):
         changed = True
     return changed

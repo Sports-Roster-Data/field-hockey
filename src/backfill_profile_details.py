@@ -64,6 +64,7 @@ class ProfileBackfiller:
         )
         self.report_path = raw_dir / "reports" / f"profile_enrichment_fhockey_{season}.json"
         self.deduplicated_school_fields = 0
+        self.reclassified_high_schools = 0
 
     def close(self) -> None:
         self.fetcher.close()
@@ -107,6 +108,7 @@ class ProfileBackfiller:
             "before_missing": baseline,
             "after_missing": field_counts(players),
             "deduplicated_school_fields": self.deduplicated_school_fields,
+            "reclassified_high_schools": self.reclassified_high_schools,
             "summary": {
                 "attempted": sum(statuses[state] for state in ("updated", "no_values", "failed")),
                 "updated": statuses["updated"],
@@ -151,16 +153,23 @@ class ProfileBackfiller:
         prior_results = prior_report.get("player_results", {})
         baseline = prior_report.get("before_missing") or field_counts(players)
         deduplicated_now = 0
+        reclassified_now = 0
         for path, cache in caches:
             cache_changed = False
             for player in cache.get("players", []):
                 if FieldExtractors.dedupe_school_fields(player):
                     deduplicated_now += 1
                     cache_changed = True
+                if FieldExtractors.reclassify_high_school_from_previous(player):
+                    reclassified_now += 1
+                    cache_changed = True
             if cache_changed:
                 atomic_json_dump(path, cache)
         self.deduplicated_school_fields = (
             prior_report.get("deduplicated_school_fields", 0) + deduplicated_now
+        )
+        self.reclassified_high_schools = (
+            prior_report.get("reclassified_high_schools", 0) + reclassified_now
         )
         results: Dict[str, Dict[str, Any]] = {}
         targets = []

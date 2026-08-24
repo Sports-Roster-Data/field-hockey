@@ -13,10 +13,11 @@
   },
   "after_missing": {
     "hometown": 4,
-    "high_school": 505,
-    "previous_school": 1853
+    "high_school": 472,
+    "previous_school": 1883
   },
   "deduplicated_school_fields": 806,
+  "reclassified_high_schools": 33,
   "summary": {
     "attempted": 1674,
     "updated": 963,
