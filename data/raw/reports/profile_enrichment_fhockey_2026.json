@@ -14,8 +14,9 @@
   "after_missing": {
     "hometown": 4,
     "high_school": 505,
-    "previous_school": 1047
+    "previous_school": 1853
   },
+  "deduplicated_school_fields": 806,
   "summary": {
     "attempted": 1674,
     "updated": 963,

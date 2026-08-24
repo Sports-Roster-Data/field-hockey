@@ -82,3 +82,22 @@ def test_backfill_updates_cache_rebuilds_aggregates_and_resumes(tmp_path, monkey
     runner.close()
     assert second_fetcher.items == []
     assert resumed["before_missing"] == report["before_missing"]
+
+
+def test_backfill_normalizes_duplicate_school_fields_without_fetching(tmp_path, monkeypatch):
+    cache_path = write_cache(tmp_path)
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    cache["players"][1]["previous_school"] = "boston latin"
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    fetcher = RecordingFetcher()
+    monkeypatch.setattr(backfill, "build_fetcher", lambda *_args, **_kwargs: fetcher)
+
+    runner = backfill.ProfileBackfiller(tmp_path, "2026")
+    report = runner.run(normalize_only=True)
+    runner.close()
+
+    normalized = json.loads(cache_path.read_text(encoding="utf-8"))["players"][1]
+    assert normalized["high_school"] == "Boston Latin"
+    assert normalized["previous_school"] == ""
+    assert report["deduplicated_school_fields"] == 1
+    assert fetcher.items == []

@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 from bs4 import BeautifulSoup
 
 from fhockey_roster_scraper import (
+    FieldExtractors,
     PROFILE_WAIT_SELECTOR,
     REPO_ROOT,
     build_fetcher,
@@ -62,6 +63,7 @@ class ProfileBackfiller:
             min_delay=delay_min, max_delay=delay_max,
         )
         self.report_path = raw_dir / "reports" / f"profile_enrichment_fhockey_{season}.json"
+        self.deduplicated_school_fields = 0
 
     def close(self) -> None:
         self.fetcher.close()
@@ -104,6 +106,7 @@ class ProfileBackfiller:
             "player_count": len(players),
             "before_missing": baseline,
             "after_missing": field_counts(players),
+            "deduplicated_school_fields": self.deduplicated_school_fields,
             "summary": {
                 "attempted": sum(statuses[state] for state in ("updated", "no_values", "failed")),
                 "updated": statuses["updated"],
@@ -138,7 +141,7 @@ class ProfileBackfiller:
 
     def run(self, batch_size: int = 50, retry_all: bool = False,
             max_profiles: int = None, retry_no_values: bool = False,
-            retry_field: str = None) -> Dict[str, Any]:
+            retry_field: str = None, normalize_only: bool = False) -> Dict[str, Any]:
         caches = self._load_caches()
         if not caches:
             raise RuntimeError(f"No successful {self.season} team caches found in {self.raw_dir / 'teams'}")
@@ -147,6 +150,18 @@ class ProfileBackfiller:
         prior_report = self._load_previous_report()
         prior_results = prior_report.get("player_results", {})
         baseline = prior_report.get("before_missing") or field_counts(players)
+        deduplicated_now = 0
+        for path, cache in caches:
+            cache_changed = False
+            for player in cache.get("players", []):
+                if FieldExtractors.dedupe_school_fields(player):
+                    deduplicated_now += 1
+                    cache_changed = True
+            if cache_changed:
+                atomic_json_dump(path, cache)
+        self.deduplicated_school_fields = (
+            prior_report.get("deduplicated_school_fields", 0) + deduplicated_now
+        )
         results: Dict[str, Dict[str, Any]] = {}
         targets = []
 
@@ -154,14 +169,17 @@ class ProfileBackfiller:
             for player_index, player in enumerate(cache.get("players", [])):
                 key = self._player_key(cache, player_index)
                 prior = prior_results.get(key, {})
-                record = {
+                record = dict(prior)
+                record.update({
                     "team": cache.get("team", ""),
                     "ncaa_id": cache.get("ncaa_id"),
                     "name": player.get("name", ""),
                     "url": player.get("url", ""),
                     "status": prior.get("status", "pending"),
-                }
+                })
                 results[key] = record
+                if normalize_only:
+                    continue
                 if not needs_backfill(player):
                     record["status"] = "not_needed"
                 elif prior.get("status") == "not_needed":
@@ -251,6 +269,8 @@ def main() -> None:
                         help="Revisit only profiles previously fetched with no parsed target details")
     parser.add_argument("--retry-field", choices=TARGET_FIELDS,
                         help="Revisit every profile still missing this specific target field")
+    parser.add_argument("--normalize-only", action="store_true",
+                        help="Normalize cached fields and rebuild aggregates without fetching profiles")
     parser.add_argument("--max-profiles", type=int,
                         help="Process at most this many profiles, then checkpoint and exit")
     args = parser.parse_args()
@@ -262,7 +282,7 @@ def main() -> None:
     try:
         report = backfiller.run(
             args.batch_size, args.retry_all, args.max_profiles, args.retry_no_values,
-            args.retry_field,
+            args.retry_field, args.normalize_only,
         )
     finally:
         backfiller.close()

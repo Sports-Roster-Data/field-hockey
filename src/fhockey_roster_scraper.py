@@ -122,6 +122,33 @@ class FieldExtractors:
         return text.strip()
 
     @staticmethod
+    def school_value_key(value: str) -> str:
+        """Normalize a school value for duplicate comparison."""
+        return re.sub(r'\W+', '', FieldExtractors.clean_text(value).casefold(),
+                      flags=re.UNICODE)
+
+    @staticmethod
+    def school_values_match(first: str, second: str) -> bool:
+        first_key = FieldExtractors.school_value_key(first)
+        return bool(first_key) and first_key == FieldExtractors.school_value_key(second)
+
+    @staticmethod
+    def dedupe_school_fields(store) -> bool:
+        """Clear previous_school when it duplicates high_school."""
+        is_dict = isinstance(store, dict)
+        high_school = ((store.get('high_school') or '') if is_dict
+                       else (getattr(store, 'high_school', '') or ''))
+        previous_school = ((store.get('previous_school') or '') if is_dict
+                           else (getattr(store, 'previous_school', '') or ''))
+        if not FieldExtractors.school_values_match(high_school, previous_school):
+            return False
+        if is_dict:
+            store['previous_school'] = ''
+        else:
+            setattr(store, 'previous_school', '')
+        return True
+
+    @staticmethod
     def extract_jersey_number(text: str) -> str:
         """Extract jersey number from various text patterns"""
         if not text:
@@ -400,14 +427,20 @@ class FieldExtractors:
                 changed = True
             if hs and not get('high_school'):
                 put('high_school', hs)
+                if FieldExtractors.school_values_match(hs, get('previous_school')):
+                    put('previous_school', '')
                 changed = True
             return changed
         elif field_name == 'high_school':
             if not get('high_school'):
                 put('high_school', value)
+                if FieldExtractors.school_values_match(value, get('previous_school')):
+                    put('previous_school', '')
                 return True
         elif field_name == 'previous_school':
             if not get('previous_school'):
+                if FieldExtractors.school_values_match(value, get('high_school')):
+                    return False
                 put('previous_school', value)
                 return True
         return False
@@ -500,6 +533,8 @@ def parse_player_profile(html, store, audit: Optional[Dict[str, Any]] = None) ->
                         'evidence': evidence,
                     }
 
+    if FieldExtractors.dedupe_school_fields(store):
+        changed = True
     return changed
 
 

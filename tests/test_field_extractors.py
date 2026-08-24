@@ -101,3 +101,22 @@ def test_apply_bio_field_dict_uses_class_key():
     row = {"position": "", "height": "", "class": "", "hometown": ""}
     assert FE.apply_bio_field(row, "Class", "So.") is True
     assert row["class"] == "Sophomore"
+
+
+def test_high_school_clears_matching_previous_school():
+    p = Player(team_id=1, team="X", season="2026", previous_school="Palmyra")
+    assert FE.apply_bio_field(p, "High School", " palmyra ") is True
+    assert p.high_school == "palmyra"
+    assert p.previous_school == ""
+
+
+def test_previous_school_is_not_added_when_it_duplicates_high_school():
+    p = Player(team_id=1, team="X", season="2026", high_school="St. John's School")
+    assert FE.apply_bio_field(p, "Previous School", "St Johns School") is False
+    assert p.previous_school == ""
+
+
+def test_dedupe_school_fields_prefers_high_school():
+    row = {"high_school": "Erasmiaans Gymnasium", "previous_school": "ERASMIAANS GYMNASIUM"}
+    assert FE.dedupe_school_fields(row) is True
+    assert row == {"high_school": "Erasmiaans Gymnasium", "previous_school": ""}
