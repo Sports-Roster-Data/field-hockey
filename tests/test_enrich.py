@@ -48,6 +48,7 @@ class RecordingFetcher:
 def complete_player():
     return Player(team_id=1, team="X", season="2025", name="Full",
                   position="D", height="5-6", year="Senior", hometown="Boston, Mass.",
+                  high_school="Boston Latin", previous_school="Example College",
                   url="https://example.com/sports/field-hockey/roster/full")
 
 
@@ -98,3 +99,19 @@ def test_scrape_profiles_false_maps_to_never():
 def test_needs_profile_gate():
     assert StandardScraper._needs_profile(sparse_player()) is True
     assert StandardScraper._needs_profile(complete_player()) is False
+
+
+def test_missing_mode_fetches_player_missing_only_high_school_or_previous_school():
+    rec = RecordingFetcher()
+    scraper = StandardScraper(fetcher=rec, profiles_mode="missing")
+    player = complete_player()
+    player.high_school = ""
+    scraper.enrich_profiles([player])
+    assert rec.fetched_urls == [player.url]
+
+    rec = RecordingFetcher()
+    scraper = StandardScraper(fetcher=rec, profiles_mode="missing")
+    player = complete_player()
+    player.previous_school = ""
+    scraper.enrich_profiles([player])
+    assert rec.fetched_urls == [player.url]

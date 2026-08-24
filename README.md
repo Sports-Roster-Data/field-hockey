@@ -75,9 +75,9 @@ many pages at once), and profile pages are only fetched **when needed**, so a
 full run takes minutes rather than hours. Controls:
 
 - `--profiles {missing,always,never}` (default `missing`): fetch a player's
-  individual profile page only when the roster list didn't already provide the
-  core fields (position, height, class, hometown). `never` is fastest (roster
-  list only); `always` fetches every profile for maximum completeness.
+  individual profile page when the roster list is missing hometown, high school,
+  or previous school. `never` is fastest (roster list only); `always` fetches
+  every profile for maximum completeness.
 - `--concurrency N` (default 6): max page loads in flight at once, across all
   sites.
 - `--per-host N` (default 3): max concurrent page loads to any single site —
@@ -117,6 +117,31 @@ uv run src/fhockey_roster_scraper.py --team 457 --season 2025
 ```bash
 uv run src/fhockey_roster_scraper.py --profiles never --season 2025
 ```
+
+### Backfill stored profile URLs without re-scraping rosters
+
+Use this for an existing season cache when roster membership must remain fixed.
+It visits the stored player profile URLs, updates only blank hometown, high
+school, and previous-school fields, rebuilds the aggregate JSON/CSV, and writes
+a resumable enrichment report.
+
+```bash
+uv run src/backfill_profile_details.py --season 2026 --fetch browser \
+  --concurrency 6 --per-host 3
+```
+
+Failed profile pages are retried on the next run; pass `--retry-all` to revisit
+pages already recorded as successfully checked.
+
+To revisit only players still missing a particular detail after parser changes:
+
+```bash
+uv run src/backfill_profile_details.py --season 2026 --fetch browser \
+  --retry-field high_school
+```
+
+Biography-derived high-school values are stored with their evidence under
+`low_confidence_fields` in the season's profile-enrichment report.
 
 ### Tune concurrency
 

@@ -413,13 +413,38 @@ class FieldExtractors:
         return False
 
 
-def parse_player_profile(html, store) -> bool:
+def _extract_bio_high_school_candidate(html) -> Optional[Tuple[str, str]]:
+    """Return a conservative high-school candidate from a labeled bio section."""
+    for heading in html.find_all(['strong', 'b', 'h3', 'h4', 'h5']):
+        label = FieldExtractors.clean_text(heading.get_text())
+        if not re.match(r'^high school(?:\s*/\s*club)?\s*:', label, re.IGNORECASE):
+            continue
+        text = FieldExtractors.clean_text(heading.parent.get_text(' ', strip=True))
+        text = re.sub(r'^high school(?:\s*/\s*club)?\s*:\s*', '', text,
+                      flags=re.IGNORECASE)
+        patterns = (
+            r'\b(?:at|attended|graduated from)\s+'
+            r'([A-Z][^.…;]{1,80}?(?:High School|Secondary School|Grammar School|'
+            r'Prep(?:aratory)? School|Academy|Gymnasium|College))\b',
+            r'\bwith\s+([A-Z][A-Za-z0-9&.\'’ -]{2,60}?)(?=\s*(?:…|\.\.\.|;|'
+            r',?\s+(?:where|and was|named|was)))',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                candidate = FieldExtractors.clean_text(match.group(1)).strip(' ,.;:-')
+                if candidate and not candidate.lower().startswith(('the team', 'her team')):
+                    return candidate, text[:500]
+    return None
+
+
+def parse_player_profile(html, store, audit: Optional[Dict[str, Any]] = None) -> bool:
     """
     Extract bio fields from a parsed player profile page into a store.
 
-    Handles the three markup variants Sidearm sites use (bio-item spans,
-    dl/dt/dd definition lists, and detail tables). `store` may be a Player or
-    a CSV dict row. Returns True if any field was populated.
+    Handles Sidearm bio-item spans, definition lists, detail tables, compact
+    fields, and a conservative biography-text fallback. `store` may be a Player
+    or a CSV dict row. Returns True if any field was populated.
     """
     changed = False
 
@@ -433,13 +458,12 @@ def parse_player_profile(html, store) -> bool:
                 if FieldExtractors.apply_bio_field(store, label_elem.get_text(), value_elem.get_text()):
                     changed = True
 
-    # 2. dl/dt/dd definition list
-    dl_section = html.find('dl', class_='sidearm-roster-player-bio')
-    if dl_section:
-        dts = dl_section.find_all('dt')
-        dds = dl_section.find_all('dd')
-        for dt, dd in zip(dts, dds):
-            if FieldExtractors.apply_bio_field(store, dt.get_text(), dd.get_text()):
+    # 2. dl/dt/dd definition lists. Newer Sidearm pages use many small generic
+    # dl elements rather than one sidearm-roster-player-bio wrapper.
+    for dl_section in html.find_all('dl'):
+        for dt in dl_section.find_all('dt'):
+            dd = dt.find_next_sibling('dd')
+            if dd and FieldExtractors.apply_bio_field(store, dt.get_text(), dd.get_text()):
                 changed = True
 
     # 3. detail tables (label in first cell, value in second)
@@ -449,6 +473,32 @@ def parse_player_profile(html, store) -> bool:
             if len(cells) >= 2:
                 if FieldExtractors.apply_bio_field(store, cells[0].get_text(), cells[1].get_text()):
                     changed = True
+
+    # 4. Sidearm's compact profile fields: a label span followed by an
+    # unclassed sibling value span (e.g. Towson's current player pages).
+    for label_elem in html.find_all('span', class_='sidearm-roster-player-field-label'):
+        value_elem = label_elem.find_next_sibling()
+        if value_elem and FieldExtractors.apply_bio_field(
+                store, label_elem.get_text(), value_elem.get_text()):
+            changed = True
+
+    # 5. Explicitly labeled biography prose. These values are lower confidence
+    # than structured fields and are recorded in the enrichment audit.
+    is_dict = isinstance(store, dict)
+    current_high_school = ((store.get('high_school') or '') if is_dict
+                           else (getattr(store, 'high_school', '') or ''))
+    if not current_high_school:
+        candidate = _extract_bio_high_school_candidate(html)
+        if candidate:
+            value, evidence = candidate
+            if FieldExtractors.apply_bio_field(store, 'High School', value):
+                changed = True
+                if audit is not None:
+                    audit.setdefault('low_confidence_fields', {})['high_school'] = {
+                        'value': value,
+                        'source': 'profile_biography',
+                        'evidence': evidence,
+                    }
 
     return changed
 
@@ -699,7 +749,11 @@ ROSTER_WAIT_SELECTOR = (
     'li.sidearm-roster-player, li.roster-list-item, .roster-card-item, '
     '.s-person-card, table.sidearm-table'
 )
-PROFILE_WAIT_SELECTOR = '.sidearm-roster-player-bio, table.sidearm-table'
+PROFILE_WAIT_SELECTOR = (
+    '.sidearm-roster-player-bio, table.sidearm-table, '
+    '.sidearm-roster-player-field-label, '
+    '[data-test-id="roster-bio-player-fields-component__ranked-field-label-value"]'
+)
 
 
 class BrowserFetcher:
@@ -897,9 +951,11 @@ def build_fetcher(mode: str = 'auto', **browser_kwargs):
 class StandardScraper:
     """Scraper for standard Sidearm Sports sites"""
 
-    # Core roster fields; a player is "complete" (no profile fetch needed) when
-    # all of these are present.
-    CORE_FIELDS = ('position', 'height', 'year', 'hometown')
+    # Profile fields that roster pages frequently omit.  Previous school is
+    # intentionally included: it remains blank when the official profile does
+    # not list one, but a profile fetch is the only authoritative way to find
+    # it for transfers.
+    PROFILE_FIELDS = ('hometown', 'high_school', 'previous_school')
 
     def __init__(self, fetcher=None, fetch_mode: str = 'auto', profiles_mode: str = 'missing',
                  scrape_profiles: Optional[bool] = None, concurrency: int = 6,
@@ -909,7 +965,7 @@ class StandardScraper:
         Args:
             fetcher: Optional pre-built fetcher (BrowserFetcher/RequestsFetcher)
             fetch_mode: 'auto' | 'browser' | 'requests' (used if fetcher is None)
-            profiles_mode: 'missing' (fetch a profile only when core fields are
+            profiles_mode: 'missing' (fetch a profile when a target detail is
                 missing), 'always', or 'never'
             scrape_profiles: Back-compat shim; True -> 'always', False -> 'never'
             concurrency: max concurrent page loads (global)
@@ -933,8 +989,8 @@ class StandardScraper:
 
     @classmethod
     def _needs_profile(cls, player: Player) -> bool:
-        """A player needs a profile fetch if any core field is still empty."""
-        return any(not getattr(player, f, '') for f in cls.CORE_FIELDS)
+        """A player needs a profile fetch if any target detail is still empty."""
+        return any(not getattr(player, f, '') for f in cls.PROFILE_FIELDS)
 
     @staticmethod
     def _referer_for(url: str) -> Optional[str]:
@@ -1724,7 +1780,7 @@ Examples:
                         help='Ignore cached per-team results and re-scrape')
     parser.add_argument('--profiles', choices=['missing', 'always', 'never'], default='missing',
                         help="When to fetch player profile pages: 'missing' (only when the "
-                             "roster omits core fields; default), 'always', or 'never' (fastest)")
+                             "roster omits a target detail; default), 'always', or 'never' (fastest)")
     # Back-compat alias: --no-scrape-profiles == --profiles never
     parser.add_argument('--no-scrape-profiles', dest='profiles', action='store_const',
                         const='never', help=argparse.SUPPRESS)

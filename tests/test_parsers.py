@@ -133,3 +133,55 @@ def test_profile_parsing_and_weight_not_height():
     assert p.position == "F"
     assert p.height == "5-8"      # from Height, not Weight
     assert p.major == "Biology"
+
+
+def test_profile_parsing_compact_sidearm_fields():
+    html = BeautifulSoup("""
+    <div class="flex-item-1"><span class="sidearm-roster-player-field-label">Hometown</span><span>Downingtown, Pa.</span></div>
+    <div class="flex-item-1"><span class="sidearm-roster-player-field-label">High School</span><span>Downingtown West</span></div>
+    <div class="flex-item-1"><span class="sidearm-roster-player-field-label">Previous School</span><span>Example College</span></div>
+    """, 'html.parser')
+    p = Player(team_id=1, team="X", season="2026")
+    assert parse_player_profile(html, p) is True
+    assert p.hometown == "Downingtown, Pa."
+    assert p.high_school == "Downingtown West"
+    assert p.previous_school == "Example College"
+
+
+def test_profile_parsing_generic_definition_lists():
+    html = BeautifulSoup("""
+    <dl class="s-text-regular">
+      <dt data-test-id="roster-bio-player-fields-component__ranked-field-label-value">High School:</dt>
+      <dd data-test-id="roster-bio-player-fields-component__ranked-field-label-value">Palmyra</dd>
+    </dl>
+    <dl><dt>Previous School:</dt><dd>Example University</dd></dl>
+    """, 'html.parser')
+    p = Player(team_id=1, team="X", season="2026")
+    assert parse_player_profile(html, p) is True
+    assert p.high_school == "Palmyra"
+    assert p.previous_school == "Example University"
+
+
+def test_profile_biography_high_school_candidate_is_audited():
+    html = BeautifulSoup("""
+    <div class="sidearm_prose"><strong>High School:</strong>
+      Won a county championship with Downingtown West … named First Team All-League.
+    </div>
+    """, 'html.parser')
+    p = Player(team_id=1, team="X", season="2026")
+    audit = {}
+    assert parse_player_profile(html, p, audit=audit) is True
+    assert p.high_school == "Downingtown West"
+    assert audit["low_confidence_fields"]["high_school"]["source"] == "profile_biography"
+
+
+def test_profile_biography_does_not_override_structured_high_school():
+    html = BeautifulSoup("""
+    <dl><dt>High School:</dt><dd>Official Academy</dd></dl>
+    <div><strong>High School:</strong> Won a title with Another School …</div>
+    """, 'html.parser')
+    p = Player(team_id=1, team="X", season="2026")
+    audit = {}
+    assert parse_player_profile(html, p, audit=audit) is True
+    assert p.high_school == "Official Academy"
+    assert "low_confidence_fields" not in audit
