@@ -833,8 +833,8 @@ class RequestsFetcher:
 # excluded: it matches stray page tables (nav/footer) in the initial HTML and
 # would let the wait return before a Vue/JS roster mounts.
 ROSTER_WAIT_SELECTOR = (
-    'li.sidearm-roster-player, li.roster-list-item, .roster-card-item, '
-    '.s-person-card, table.sidearm-table'
+    'li.sidearm-roster-player, li.roster-list-item, li.player-list-item, '
+    '.roster-card-item, .s-person-card, table.sidearm-table'
 )
 PROFILE_WAIT_SELECTOR = (
     '.sidearm-roster-player-bio, table.sidearm-table, '
@@ -1121,17 +1121,32 @@ class StandardScraper:
 
         # Modern Sidearm sites serve season rosters at /roster/season/<year>;
         # try that before the bare /roster (current season) and legacy .aspx.
-        for suffix in (f'/roster/season/{season}', '/roster', '/roster.aspx'):
+        season_suffix = f'/roster/season/{season}'
+        for suffix in (season_suffix, '/roster', '/roster.aspx'):
             todo = [i for i, (s, _h) in enumerate(results) if s == 404]
             if not todo:
                 break
             logger.info(f"Retrying {len(todo)} team(s) with {suffix}")
             retry_wave(todo, suffix)
 
-        out = []
-        for (team, url, _ref), (status, html) in zip(entries, results):
-            out.append(self._parse_roster_result(team, season, division, status, html))
-        return out
+        # Some sites answer /roster/<year> with 200 but serve current-season or
+        # even wrong-sport content (e.g. Penn State's /roster/2021 returns the
+        # football roster). Those parse to zero players, so for any 200 page that
+        # yielded no players and wasn't already fetched via the season-specific
+        # form, retry with /roster/season/<year> and re-parse.
+        results_parsed = [self._parse_roster_result(entries[i][0], season, division, s, h)
+                          for i, (s, h) in enumerate(results)]
+        todo = [i for i, r in enumerate(results_parsed)
+                if not r.players and results[i][0] == 200
+                and not entries[i][1].rstrip('/').endswith(season_suffix)]
+        if todo:
+            logger.info(f"Retrying {len(todo)} empty team(s) with {season_suffix}")
+            retry_wave(todo, season_suffix)
+            for i in todo:
+                s, h = results[i]
+                results_parsed[i] = self._parse_roster_result(entries[i][0], season, division, s, h)
+
+        return results_parsed
 
     def _parse_roster_result(self, team: Dict, season: str, division: str,
                              status: int, html: Optional[str]) -> TeamResult:
@@ -1190,8 +1205,8 @@ class StandardScraper:
         if not roster_items:
             # Modern Sidearm layouts replaced the classic markup on many sites.
             # Try each newer layout, then fall back to a generic table.
-            for extractor in (self._extract_list_items, self._extract_card_items,
-                              self._extract_person_cards):
+            for extractor in (self._extract_list_items, self._extract_player_list_items,
+                              self._extract_card_items, self._extract_person_cards):
                 players = extractor(html, team_id, team_name, season, division, base_url)
                 if players:
                     return players
@@ -1319,6 +1334,53 @@ class StandardScraper:
                 players.append(player)
             except Exception as e:
                 logger.warning(f"Error parsing list item in {team_name}: {e}")
+        return players
+
+    def _extract_player_list_items(self, html, team_id, team_name, season, division, base_url):
+        """Extract players from the newest Sidearm list layout.
+
+        Player is ``li.player-list-item``; name/profile link is
+        ``a.player-list-item__title-link``, jersey is
+        ``.player-list-item__jersey-number``, position is
+        ``.player-list-item__position``, and each remaining bio field is a
+        ``span.profile-field-content`` (title/value) pair. Seen on gopsusports
+        and other sites' season rosters (``/roster/season/<year>``).
+        """
+        players = []
+        for item in html.find_all('li', class_='player-list-item'):
+            try:
+                jersey_elem = item.find(class_='player-list-item__jersey-number')
+                jersey = FieldExtractors.extract_jersey_number(
+                    FieldExtractors.clean_text(jersey_elem.get_text())) if jersey_elem else ''
+                # Coaches/staff share this markup but carry no jersey number.
+                if not jersey:
+                    continue
+
+                name_link = (item.find('a', class_='player-list-item__title-link', href=True)
+                             or item.find('a', class_='player-list-item__title', href=True))
+                if not name_link:
+                    continue
+                name = FieldExtractors.clean_text(name_link.get_text())
+                profile_url = self._absolute_url(base_url, name_link['href'])
+
+                player = Player(team_id=team_id, team=team_name, season=season,
+                                division=division, name=name, jersey=jersey, url=profile_url)
+
+                pos_elem = item.find(class_='player-list-item__position')
+                if pos_elem:
+                    raw_pos = FieldExtractors.clean_text(pos_elem.get_text())
+                    player.position = raw_pos if '/' in raw_pos else \
+                        (FieldExtractors.extract_position(raw_pos) or raw_pos)
+
+                for field_el in item.find_all(class_='profile-field-content'):
+                    label_el = field_el.find(class_='profile-field-content__title')
+                    value_el = field_el.find(class_='profile-field-content__value')
+                    if label_el and value_el:
+                        FieldExtractors.apply_bio_field(player, label_el.get_text(),
+                                                        value_el.get_text())
+                players.append(player)
+            except Exception as e:
+                logger.warning(f"Error parsing player list item in {team_name}: {e}")
         return players
 
     def _extract_card_items(self, html, team_id, team_name, season, division, base_url):
@@ -1598,6 +1660,12 @@ class StandardScraper:
                 # High School
                 if hs_idx is not None and hs_idx < len(cols):
                     high_school = FieldExtractors.clean_text(cols[hs_idx].get_text())
+
+                # Skip empty rows (e.g. layout/spacer rows, or a wrong-sport
+                # fallback table with no roster data). A real player row always
+                # has at least a name or a jersey number.
+                if not name and not jersey:
+                    continue
 
                 player = Player(
                     team_id=team_id,
